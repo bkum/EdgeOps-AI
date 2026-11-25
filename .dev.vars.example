@@ -1,0 +1,12 @@
+# Copy to .dev.vars and replace with a randomly generated token of at least 32 characters.
+LOCAL_API_TOKEN="replace-with-a-random-local-token-at-least-32-characters"
+# Explicit offline fixture output; never presented as model inference.
+AI_MODE="fixture"
+# For real Workers AI: add ai.binding=AI to a private Wrangler config,
+# use AI_MODE=remote, authenticate Wrangler, and configure a daily call limit.
+
+# Optional read-only provider secrets (never enter these in the dashboard):
+# CLOUDFLARE_TELEMETRY_TOKEN=...
+# GITHUB_READ_TOKEN=...
+# SUPABASE_READ_TOKEN=...
+# Resource identifiers must also be explicitly approved in PROVIDER_RESOURCES.

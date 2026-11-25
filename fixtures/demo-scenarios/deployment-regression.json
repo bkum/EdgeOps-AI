@@ -1,0 +1,9 @@
+{
+  "name": "deployment-regression",
+  "source": "synthetic fixture, not live telemetry",
+  "samples": [
+    { "observedAt": "2026-11-24T08:00:00.000Z", "status": "healthy", "latencyMs": 90 },
+    { "observedAt": "2026-11-24T08:05:00.000Z", "status": "unhealthy", "latencyMs": 2100 },
+    { "observedAt": "2026-11-24T08:10:00.000Z", "status": "unhealthy", "latencyMs": 2400 }
+  ]
+}
