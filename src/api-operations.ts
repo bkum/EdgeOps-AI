@@ -15,6 +15,7 @@ import { syncIntegration } from "./providers";
 import type { Env, Principal } from "./types";
 import { reconcile } from "./dispatch";
 import { mayUseScope } from "./auth";
+import { apiError } from "./http";
 import { deploymentComparisons } from "./deployments";
 export const operationsApi = new Hono<{
   Bindings: Env;
@@ -86,9 +87,11 @@ operationsApi.post("/services", async (c) => {
     .stmt("SELECT mode FROM environments WHERE scope=?")
     .first<{ mode: string }>();
   if (input.kind === "synthetic" && environment?.mode !== "demo")
-    return c.json(
-      { error: { message: "Synthetic probes are restricted to demo scopes" } },
+    return apiError(
+      c,
       422,
+      "validation_failed",
+      "Synthetic probes are restricted to demo scopes",
     );
   if (input.kind === "http") approvedURL(input.targetUrl!, c.env, r.scope);
   return c.json(
@@ -116,7 +119,7 @@ operationsApi.post("/services/:id/probes", async (c) => {
     )
     .first<{ service_id: string }>();
   if (existing && existing.service_id !== c.req.param("id"))
-    return c.json({ error: { message: "Idempotency conflict" } }, 409);
+    return apiError(c, 409, "idempotency_conflict", "Idempotency conflict");
   if (existing) return c.json(data({ status: "already_recorded" }));
   const tick = Math.floor(Date.now() / 60000);
   const lease = await r
@@ -128,9 +131,12 @@ operationsApi.post("/services/:id/probes", async (c) => {
     )
     .run();
   if (!lease.meta.changes)
-    return c.json(
-      { error: { message: "One manual probe per service per minute" } },
+    return apiError(
+      c,
       429,
+      "rate_limited",
+      "One manual probe per service per minute",
+      true,
     );
   const result = await runMonitor(
     c.env,
@@ -226,7 +232,14 @@ operationsApi.post("/integrations/:provider/:serviceId/sync", async (c) => {
     Date.now() - Date.parse(integration.last_checked_at) < 60000;
   if (recent)
     return c.json(
-      { error: { message: "Integration refresh limited to once per minute" } },
+      {
+        error: {
+          code: "rate_limited",
+          message: "Integration refresh limited to once per minute",
+          retryable: true,
+        },
+        requestId: c.get("requestId"),
+      },
       429,
     );
   return c.json(data(await syncIntegration(c.env, r, integration)));

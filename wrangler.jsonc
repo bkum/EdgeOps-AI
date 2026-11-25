@@ -17,6 +17,9 @@
     "AI_MODE": "fixture",
     "DAILY_AI_LIMIT": "10",
     "ACCESS_SUBJECTS": "",
+    // Optional per-subject environment grants, e.g. {"<sub>":["trustplate/production"]}.
+    // Empty means every allowed subject may use every environment.
+    "SCOPE_GRANTS": "",
     "ACCESS_TEAM_DOMAIN": "",
     "ACCESS_AUD": "",
     "PROBE_ALLOWLIST": "[{\"scope\": \"trustplate/production\", \"url\": \"https://api.trustplate.in/health\"}]",

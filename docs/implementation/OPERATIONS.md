@@ -15,6 +15,14 @@ All migrations are required. Migration 0003 records conversation activity so ina
 
 Connect at `http://127.0.0.1:8787`. The application selector switches applications; Environment switches environments. The backend authorizes `X-EdgeOps-Scope` against registered environments in the trusted operator's workspace on every request. Every repository/provider/tool lookup remains scoped. Initial scopes are `synthetic/demo` and `trustplate/production`. This is a private, single trusted workspace; it is not a public multitenant demo.
 
+**Restricting environments per operator.** Set `SCOPE_GRANTS` to restrict which environments each Access subject can use. The format is a JSON object mapping each subject to its scopes, for example `{"<sub-a>":["*"],"<sub-b>":["trustplate/production"]}`.
+- When it is set, any subject not listed is denied, and invalid JSON denies everyone.
+- Only `*` subjects can register environments.
+- Left empty, every subject in `ACCESS_SUBJECTS` can use every environment.
+- The local development token always has `*`.
+
+**Environment limits.** A private deployment refuses to create demo environments. The workspace is capped at 50 environments, and each environment at 20 services.
+
 ## Functional flows
 
 | View | Behavior |

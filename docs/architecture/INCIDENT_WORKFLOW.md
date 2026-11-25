@@ -5,16 +5,31 @@ Incident status: open → investigating → awaiting_operator → verifying → 
 ```mermaid
 stateDiagram-v2
   [*] --> Open
-  Open --> Investigating
-  Investigating --> AwaitingOperator
-  AwaitingOperator --> Verifying
-  Verifying --> Resolved
-  Verifying --> Investigating
+  Open --> Investigating: evidence collection starts
+  Investigating --> AwaitingOperator: findings saved / run partial
+  AwaitingOperator --> Verifying: operator requests verification
+  Investigating --> Verifying: operator verifies early
+  Verifying --> Resolved: 3 distinct healthy runs, operator resolves
+  Verifying --> Investigating: unhealthy run, new attempt queued
+  Verifying --> AwaitingOperator: unhealthy run, attempt cap reached
+  AwaitingOperator --> Investigating: operator retry
+  Open --> AwaitingOperator: operator cancels run
+  Investigating --> AwaitingOperator: operator cancels run
   Open --> Dismissed
   Investigating --> Dismissed
+  AwaitingOperator --> Dismissed
+  Verifying --> Dismissed
   Resolved --> [*]
   Dismissed --> [*]
 ```
+
+Implemented transitions (verified against `src/operations.ts`, 2026-11-25):
+
+- **Verify** is accepted from `awaiting_operator` or `investigating`. An operator may verify an externally applied fix before the investigation finishes.
+- **Dismiss** is accepted from any open state. It records a reason and cancels unfinished diagnostic work.
+- **Cancel** stops the run and returns the incident to `awaiting_operator`, where it can be retried.
+- **Retry** is allowed for `partial`, `failed` or `cancelled` runs, up to five attempts.
+- **Failed verification** re-queues a new attempt when the cap allows; otherwise it returns the incident to the operator. Only probe runs recorded after the latest verify request count.
 
 1. Detect threshold breach using valid windows/sample counts. Claim a scope/service/signal dedupe key, persist incident and dispatch intent.
 2. Dispatch Workflow with stable run ID; reconcile dispatch failures from the outbox. Replays return the existing run.

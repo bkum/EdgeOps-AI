@@ -154,7 +154,14 @@ try {
   const overviewResponse = await api("/overview");
   assertHardened(overviewResponse, "API JSON");
   assert.equal(overviewResponse.headers.get("cache-control"), "no-store");
-  assert.equal((await api("/incidents/foreign-scope-id")).status, 404);
+  const missing = await api("/incidents/foreign-scope-id");
+  assert.equal(missing.status, 404);
+  // Unknown resources use the documented JSON error envelope.
+  const missingBody = await missing.json();
+  assert.equal(missingBody.error.code, "not_found");
+  assert.equal(missingBody.error.retryable, false);
+  assert(missingBody.requestId);
+  assert.equal((await api("/no-such-route")).status, 404);
   assert.equal((await scenario("healthy", "smoke-healthy")).status, 202);
   assert.equal(
     (await scenario("insufficient-data", "smoke-unknown")).status,
@@ -783,6 +790,8 @@ try {
   assert(usage.probes > 0);
   const exported = await (await api("/export")).json();
   assert.equal(exported.data.scope, "synthetic/demo");
+  assert(exported.data.incidents.some((i) => i.events.length > 0), "export includes events");
+  assert.equal(exported.data.truncated.incidents, false);
   assert(!JSON.stringify(exported).includes(token));
   console.log(
     "PASS: recovery, optimistic/idempotent operator actions, confirmed knowledge in a new conversation, corrections/deletion and context invalidation, recurrence, budget stop, scoped export and demo/live isolation.",

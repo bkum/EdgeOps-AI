@@ -5,7 +5,7 @@ Assets: provider credentials, operational topology, incident evidence, chat hist
 | Threat | Impact | Control | Verification |
 | --- | --- | --- | --- |
 | Forged Access identity/origin bypass | Unauthorized diagnostics | JWT validation and protected routes | Invalid signature/audience/expired and direct-route tests |
-| Cross-environment IDs | Data disclosure | Scope checks in repositories/tools | Swap IDs in API, chat, evidence and memory |
+| Cross-environment IDs | Data disclosure | Scope checks in repositories/tools; optional per-subject `SCOPE_GRANTS` | Swap IDs in API, chat, evidence and memory; grant parsing tests |
 | Malicious telemetry instructions | Exfiltration or privilege escalation | Data-only inputs, tool allowlist, server policy | Inject adversarial log/runbook fixtures |
 | Probe SSRF/DNS rebinding | Internal access | Registered HTTPS targets, address/redirect checks | Local/private targets, alternate IP notation and rebinding tests |
 | Tokens/PII in logs | Confidentiality breach | Structured minimization and redaction before all stores | Seed canary secrets; assert absent downstream |

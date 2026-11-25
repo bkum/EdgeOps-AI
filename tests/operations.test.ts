@@ -1,17 +1,20 @@
 import { readFile } from "node:fs/promises";
 import { beforeAll, afterAll, describe, it, expect } from "vitest";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
-import { Operations } from "../src/operations";
+import { Operations, MAX_SERVICES, MAX_SCOPES } from "../src/operations";
+import { evidencePrompt } from "../src/inference";
 import {
   serviceSchema,
   integrationSchema,
   operatorSchema,
+  settingsSchema,
 } from "../src/contracts";
 import { samplesFor } from "../src/fixtures";
 import {
   probeHTTP,
   approvedURL,
   publicIPv4,
+  publicIPv6,
   schedule,
   expireConversations,
 } from "../src/probes";
@@ -943,6 +946,260 @@ describe("operational lifecycle, policies and adapters", () => {
       for (const canary of planted) expect(rows, name).not.toContain(canary);
     }
   });
+  it("rejects a service beyond the per-environment cap with a conflict, not a retryable error", async () => {
+    await repo.createScope(
+      { applicationId: "capapp", applicationName: "Cap app", environment: "demo", mode: "demo" },
+      "tester",
+    );
+    const capped = new Operations(repo.db, "capapp/demo");
+    for (let i = 0; i < MAX_SERVICES; i++)
+      await capped.saveService(
+        serviceSchema.parse({ id: `svc-${i}`, name: `Service ${i}`, kind: "synthetic" }),
+        "tester",
+      );
+    await expect(
+      capped.saveService(
+        serviceSchema.parse({ id: "svc-extra", name: "Extra", kind: "synthetic" }),
+        "tester",
+      ),
+    ).rejects.toThrow(/maximum of 20 services/);
+    // Updating an existing service at the cap still works.
+    await capped.saveService(
+      serviceSchema.parse({ id: "svc-0", name: "Renamed", kind: "synthetic" }),
+      "tester",
+    );
+    expect((await capped.services()).find((s) => s.id === "svc-0")?.name).toBe("Renamed");
+  });
+
+  it("records the price check date only when prices change", async () => {
+    const save = (input: Partial<Record<string, unknown>>) =>
+      repo.saveSettings(
+        settingsSchema.parse({
+          dailyAiLimit: 100,
+          aiEnabled: true,
+          inputPrice: 0.3,
+          outputPrice: 2,
+          retentionDays: 30,
+          ...input,
+        }),
+        "tester",
+      );
+    const checked = async () => (await repo.settings())?.price_checked_at;
+    await save({ inputPrice: 0.31 });
+    const first = await checked();
+    expect(first).toBeTruthy();
+    await pause();
+    await save({ inputPrice: 0.31, retentionDays: 31 });
+    expect(await checked()).toBe(first);
+    await pause();
+    await save({ inputPrice: 0.32 });
+    expect(await checked()).not.toBe(first);
+    await save({ inputPrice: null, outputPrice: null });
+    expect(await checked()).toBeNull();
+    await save({ inputPrice: null, outputPrice: null, aiEnabled: true });
+  });
+
+  it("packs whole evidence records into the prompt and only allows citing what was sent", () => {
+    const evidence = Array.from({ length: 12 }, (_, i) => ({
+      id: `ev-${i}`,
+      investigation_id: "inv",
+      provider: "synthetic-probe",
+      summary: `"quoted" ${"x".repeat(1500)}`,
+      observed_at: "2026-11-24T08:00:00.000Z",
+      fetched_at: "2026-11-24T08:00:00.000Z",
+    }));
+    const prompt = evidencePrompt(evidence as never);
+    expect(prompt.content.length).toBeLessThanOrEqual(12000);
+    const parsed = JSON.parse(prompt.content);
+    expect(parsed.evidence.map((e: { id: string }) => e.id)).toEqual(prompt.ids);
+    expect(parsed.omitted).toBe(12 - prompt.ids.length);
+    expect(prompt.ids.length).toBeGreaterThan(0);
+    expect(prompt.ids.length).toBeLessThan(12);
+  });
+
+  it("replaces rather than duplicates telemetry when a sync repeats within a minute", async () => {
+    await repo.saveService(
+      serviceSchema.parse({ id: "db-health", name: "DB health", kind: "synthetic" }),
+      "tester",
+    );
+    await repo.saveIntegration(
+      integrationSchema.parse({
+        provider: "supabase",
+        serviceId: "db-health",
+        enabled: true,
+        config: { projectRef: "abcdefghij0123" },
+      }),
+      "tester",
+    );
+    const integration = (await repo.integrations()).find(
+      (i) => i.provider === "supabase" && i.service_id === "db-health",
+    )!;
+    const env = {
+      DB: repo.db,
+      SUPABASE_READ_TOKEN: "synthetic-test-token",
+      PROVIDER_RESOURCES: JSON.stringify([
+        { scope: repo.scope, provider: "supabase", resource: "abcdefghij0123" },
+      ]),
+    } as unknown as Env;
+    const fetcher = (async () =>
+      Response.json([{ name: "db", healthy: true, status: "ACTIVE_HEALTHY" }])) as typeof fetch;
+    await syncIntegration(env, repo, integration, fetcher);
+    await syncIntegration(env, repo, integration, fetcher);
+    const rows = await repo
+      .stmt(
+        "SELECT COUNT(*) AS n FROM telemetry WHERE scope=? AND service_id='db-health'",
+      )
+      .first<{ n: number }>();
+    expect(rows?.n).toBe(1);
+  });
+
+  it("exports incident events and reports whether limits truncated the export", async () => {
+    const exported = await repo.exportScope();
+    expect(exported.incidents.length).toBeGreaterThan(0);
+    const withEvents = exported.incidents.find((i) => i.events.length > 0);
+    expect(withEvents?.events[0]).toHaveProperty("action");
+    expect(exported.truncated).toEqual({
+      incidents: false,
+      knowledge: false,
+      telemetry: false,
+      events: false,
+    });
+    expect(JSON.stringify(exported)).not.toContain("synthetic-test-token");
+  });
+
+  it("retention purge removes only expired records of its own environment", async () => {
+    await repo.createScope(
+      { applicationId: "purgeapp", applicationName: "Purge app", environment: "demo", mode: "demo" },
+      "tester",
+    );
+    const purging = new Operations(repo.db, "purgeapp/demo");
+    const old = "2000-01-01T00:00:00.000Z";
+    for (const id of ["closed-svc", "open-svc"])
+      await purging.saveService(
+        serviceSchema.parse({ id, name: id, kind: "synthetic" }),
+        "tester",
+      );
+    const closed = (await purging.scenario("deployment-regression", "purge-closed", "tester", "closed-svc")).incident!.id;
+    const open = (await purging.scenario("deployment-regression", "purge-open", "tester", "open-svc")).incident!.id;
+    await purging.saveEvidence(closed);
+    await purging.saveEvidence(open);
+    await purging
+      .stmt(
+        "UPDATE incidents SET status='resolved',resolved_at=?2 WHERE scope=?1 AND id=?3",
+        old,
+        closed,
+      )
+      .run();
+    await purging
+      .stmt(
+        "INSERT INTO knowledge_entries(scope,id,incident_id,content,confirmed_by,confirmed_at) VALUES(?,?,?,?,?,?)",
+        "old-lesson",
+        closed,
+        "Old lesson",
+        "tester",
+        old,
+      )
+      .run();
+    // Age the open incident's probe samples and evidence past retention.
+    await purging
+      .stmt("UPDATE health_checks SET recorded_at=?2 WHERE scope=?1 AND service_id='open-svc'", old)
+      .run();
+    await purging
+      .stmt("UPDATE evidence SET fetched_at=?2 WHERE scope=?1 AND investigation_id=?3", old, open)
+      .run();
+    // An identical old row in another environment must survive.
+    await repo
+      .stmt("UPDATE health_checks SET recorded_at=?2 WHERE scope=?1 AND service_id='front'", old)
+      .run();
+    const otherBefore = await repo
+      .stmt("SELECT COUNT(*) AS n FROM health_checks WHERE scope=? AND service_id='front'")
+      .first<{ n: number }>();
+    const revision = (await purging.stmt("SELECT memory_revision AS r FROM settings WHERE scope=?").first<{ r: number }>())!.r;
+    await purging.purge();
+    const count = async (sql: string, ...args: string[]) =>
+      (await purging.stmt(sql, ...args).first<{ n: number }>())!.n;
+    expect(await purging.incident(closed)).toBeNull();
+    expect(await count("SELECT COUNT(*) AS n FROM knowledge_entries WHERE scope=? AND incident_id=?", closed)).toBe(0);
+    expect(await count("SELECT COUNT(*) AS n FROM incident_events WHERE scope=? AND incident_id=?", closed)).toBe(0);
+    expect(await count("SELECT COUNT(*) AS n FROM investigations WHERE scope=? AND incident_id=?", closed)).toBe(0);
+    const kept = (await purging.incident(open))!;
+    expect(kept.incident.status).not.toBe("resolved");
+    expect(kept.evidence).toEqual([]);
+    expect(await count("SELECT COUNT(*) AS n FROM health_checks WHERE scope=? AND service_id='open-svc'")).toBe(0);
+    expect(
+      (await purging.stmt("SELECT memory_revision AS r FROM settings WHERE scope=?").first<{ r: number }>())!.r,
+    ).toBe(revision + 1);
+    const otherAfter = await repo
+      .stmt("SELECT COUNT(*) AS n FROM health_checks WHERE scope=? AND service_id='front'")
+      .first<{ n: number }>();
+    expect(otherAfter?.n).toBe(otherBefore?.n);
+  });
+
+  it("keeps maintaining other conversations and environments when an agent is unreachable", async () => {
+    const recent = new Date().toISOString();
+    await repo
+      .stmt(
+        "INSERT OR REPLACE INTO conversations(scope,id,agent_name,actor,created_at,last_used_at,maintained_at) VALUES(?,?,?,?,?,?,?)",
+        "unreachable-chat",
+        "agent-unreachable",
+        "tester",
+        recent,
+        recent,
+        "2000-01-01T00:00:00.000Z",
+      )
+      .run();
+    const env = {
+      DB: repo.db,
+      DAILY_AI_LIMIT: "100",
+      AI_MODE: "fixture",
+      MODE: "development",
+      INVESTIGATION: {
+        get: async () => ({ status: async () => ({ status: "complete" }) }),
+        create: async () => ({}),
+      },
+      ASSISTANT: {
+        idFromName: (name: string) => name,
+        get: () => ({
+          fetch: async () => {
+            throw new Error("agent unavailable");
+          },
+        }),
+      },
+    } as unknown as Env;
+    await expect(schedule(env)).resolves.toBeUndefined();
+    const maintained = await repo
+      .stmt("SELECT maintained_at AS t FROM conversations WHERE scope=? AND id='unreachable-chat'")
+      .first<{ t: string }>();
+    expect(maintained?.t).not.toBe("2000-01-01T00:00:00.000Z");
+  });
+
+  it("caps the number of environments in the workspace", async () => {
+    const before = (await repo.scopes()).length;
+    const created: string[] = [];
+    for (let i = before; i < MAX_SCOPES; i++) {
+      await repo.createScope(
+        { applicationId: `fill${i}`, applicationName: `Fill ${i}`, environment: "demo", mode: "demo" },
+        "tester",
+      );
+      created.push(`fill${i}`);
+    }
+    await expect(
+      repo.createScope(
+        { applicationId: "overflow", applicationName: "Overflow", environment: "demo", mode: "demo" },
+        "tester",
+      ),
+    ).rejects.toThrow(/maximum of 50 environments/);
+    // Re-registering an existing environment is not blocked by the cap.
+    await repo.createScope(
+      { applicationId: "fill" + before, applicationName: "Again", environment: "demo", mode: "demo" },
+      "tester",
+    );
+    for (const app of created) {
+      await repo.db.prepare("DELETE FROM settings WHERE scope=?").bind(`${app}/demo`).run();
+      await repo.db.prepare("DELETE FROM environments WHERE scope=?").bind(`${app}/demo`).run();
+      await repo.db.prepare("DELETE FROM applications WHERE id=?").bind(app).run();
+    }
+  });
 });
 
 describe("probe target policy", () => {
@@ -954,6 +1211,26 @@ describe("probe target policy", () => {
       },
     ]),
   } as Env;
+  it("treats only global unicast IPv6 and public IPv4 as public resolutions", () => {
+    for (const address of ["2606:4700::6810:84e5", "2a00:1450:4001:82a::200e"])
+      expect(publicIPv6(address)).toBe(true);
+    for (const address of [
+      "2002:7f00:1::1", // 6to4 embedding 127.0.0.1
+      "2002:a00:1::1", // 6to4 embedding 10.0.0.1
+      "2001:0:4136:e378::1", // Teredo
+      "2001:0000:4136:e378::1",
+      "2001:db8::1",
+      "3fff:0:0:0::1",
+      "3fff:fff::1",
+      "fd00::1",
+      "fe80::1",
+      "::1",
+      "::ffff:127.0.0.1",
+    ])
+      expect(publicIPv6(address), address).toBe(false);
+    expect(publicIPv4("192.88.99.1")).toBe(false);
+    expect(publicIPv4("8.8.8.8")).toBe(true);
+  });
   it("rejects SSRF targets, credentials, redirects and scope crossover", async () => {
     for (const url of [
       "http://api.trustplate.in/health",

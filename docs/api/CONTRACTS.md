@@ -36,6 +36,19 @@ All paths below use `/api/v1`. `X-EdgeOps-Scope` selects an authorized registere
 | GET /export; POST /retention/run | Scoped sanitized export and retention cleanup |
 | GET, POST, DELETE /assistant | Persistent per-actor conversations; POST accepts free-text question and optional conversationId, GET/DELETE accept conversationId query |
 
+Implemented conventions (2026-11-25):
+
+- **Errors:** every error uses `{error: {code, message, retryable}, requestId}`. That includes 404 for unknown or foreign resources, validation (422), conflicts (409), rate limits (429, retryable) and dependency failures (503).
+- **Idempotent replay:** reusing an `Idempotency-Key` with the same payload returns the resource's **current** state, not a stored copy of the first response. A different payload returns 409.
+- **Pagination:** lists are bounded rather than paginated:
+  - 20 recent incidents in the overview
+  - 50 notifications
+  - 100 telemetry, knowledge and audit rows
+  - export: 500 incidents, 1000 knowledge and telemetry rows, 5000 events, with `truncated` flags
+
+  Cursor pagination remains proposed.
+- **Environment access:** `GET /scopes` lists only environments the principal may use. With `SCOPE_GRANTS` set, other environments return 404, and only principals granted `*` may register environments. A private deployment rejects demo environments.
+
 Assistant SSE frames: `progress`, `delta` (validated text), `conversation` (canonical messages/status/citations) and safe `error`. A conversation is keyed by verified actor, scope and conversationId. Model-selected tools are read-only and have strict argument schemas; models cannot call mutating HTTP endpoints. Confirmed-knowledge changes invalidate derived conversation context.
 
 ## Proposed full MVP API

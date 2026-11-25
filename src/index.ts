@@ -9,6 +9,7 @@ import { operationsApi } from "./api-operations";
 import { schedule } from "./probes";
 import { Conflict, Repository } from "./repository";
 import { reconcile } from "./dispatch";
+import { apiError } from "./http";
 import { SCOPE, type Env, type Principal } from "./types";
 export { InvestigationWorkflow } from "./workflow";
 export { OpsAgent } from "./agent";
@@ -291,6 +292,10 @@ app.on(["GET", "POST", "DELETE"], "/api/v1/assistant", async (c) => {
 app.route("/api/v1", operationsApi);
 app.all("/api/*", (c) => c.notFound());
 app.all("/agents/*", (c) => c.notFound());
+// Unknown or unavailable resources return the standard JSON envelope, never HTML.
+app.notFound((c) =>
+  apiError(c, 404, "not_found", "Resource not found in this environment"),
+);
 app.get("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 app.onError((error, c) => {
   const validation =

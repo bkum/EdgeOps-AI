@@ -1,6 +1,11 @@
 import { generateKeyPair, SignJWT } from "jose";
 import { describe, expect, it } from "vitest";
-import { authenticate, verifyAccess } from "../src/auth";
+import {
+  authenticate,
+  verifyAccess,
+  scopeGrants,
+  mayUseScope,
+} from "../src/auth";
 import type { Env } from "../src/types";
 
 describe("authentication", () => {
@@ -88,5 +93,31 @@ describe("authentication", () => {
         { ...env, MODE: "private" },
       ),
     ).toBeNull();
+  });
+  it("applies optional per-subject environment grants and fails closed on bad config", () => {
+    const base = { MODE: "private" } as Env;
+    expect(scopeGrants(base, "anyone")).toBe("*");
+    const grants = {
+      ...base,
+      SCOPE_GRANTS: JSON.stringify({
+        admin: ["*"],
+        viewer: ["trustplate/production"],
+      }),
+    };
+    expect(scopeGrants(grants, "admin")).toBe("*");
+    expect(scopeGrants(grants, "viewer")).toEqual(["trustplate/production"]);
+    expect(scopeGrants(grants, "unlisted")).toEqual([]);
+    expect(scopeGrants({ ...base, SCOPE_GRANTS: "{not json" }, "admin")).toBeNull();
+    expect(
+      scopeGrants({ ...base, SCOPE_GRANTS: '{"viewer":["../etc"]}' }, "viewer"),
+    ).toBeNull();
+    const viewer = {
+      actor: "viewer",
+      scope: "synthetic/demo",
+      scopes: ["trustplate/production"],
+    };
+    expect(mayUseScope(viewer, "trustplate/production")).toBe(true);
+    expect(mayUseScope(viewer, "synthetic/demo")).toBe(false);
+    expect(mayUseScope({ ...viewer, scopes: "*" }, "synthetic/demo")).toBe(true);
   });
 });
