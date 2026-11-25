@@ -179,8 +179,53 @@ export function IncidentControls({
       setBusy(false);
     }
   }
+  async function dispose(id: string, version: number, disposition: string) {
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/incidents/${detail.incident.id}/recommendations/${id}`, {
+        method: "PATCH",
+        body: json({ disposition, expectedVersion: version }),
+      });
+      await onChange();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
   return (
     <section className="space-y-4 border-t pt-6">
+      {!!detail.recommendations?.length && (
+        <div className="space-y-2">
+          <h3 className="text-sm font-semibold">Recommendations</h3>
+          <p className="text-xs text-muted-foreground">
+            Record what you decided. EdgeOps never carries out an action.
+          </p>
+          {detail.recommendations.map((r) => (
+            <div key={r.id} className="space-y-2 rounded-md border p-2 text-xs">
+              <p>{r.action}</p>
+              {r.rationale && <p className="text-muted-foreground">{r.rationale}</p>}
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="secondary">{r.disposition}</Badge>
+                {(["accepted", "rejected", "done"] as const)
+                  .filter((d) => d !== r.disposition)
+                  .map((d) => (
+                    <Button
+                      key={d}
+                      variant="outline"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => void dispose(r.id, r.version, d)}
+                    >
+                      {d === "accepted" ? "Accept" : d === "rejected" ? "Reject" : "Mark done"}
+                    </Button>
+                  ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
       <h3 className="text-sm font-semibold">Operator review</h3>
       {closed ? (
         <Alert>
@@ -190,6 +235,9 @@ export function IncidentControls({
               ? `Recovery verified. Cause: ${detail.incident.cause_status ?? "unknown"}.`
               : "Incident dismissed by an operator."}
           </AlertDescription>
+          {detail.incident.status === "resolved" && detail.recovery && (
+            <RecoveryReport report={detail.recovery} />
+          )}
         </Alert>
       ) : (
         <>
@@ -214,6 +262,7 @@ export function IncidentControls({
                   ? "Recovery checks passed"
                   : "Waiting for 3 consecutive healthy runs"}
               </Badge>
+              {detail.recovery && <RecoveryReport report={detail.recovery} />}
               <Field label="Confirmed cause (optional)" id="confirmed-cause">
                 <textarea
                   id="confirmed-cause"
@@ -645,12 +694,16 @@ export function OperationsPanel({
     >([]),
     [comparisons, setComparisons] = useState<DeploymentComparison[]>([]),
     [usage, setUsage] = useState<Record<string, unknown>>({}),
+    [destinations, setDestinations] = useState<
+      { destination: string; host: string; format: string; sent: number; pending: number; failed: number }[]
+    >([]),
     [settings, setSettings] = useState<SettingsInput>({
       dailyAiLimit: 10,
       aiEnabled: true,
       inputPrice: null,
       outputPrice: null,
       retentionDays: 30,
+      operatorWaitHours: 24,
     }),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
@@ -692,6 +745,7 @@ export function OperationsPanel({
         input_price: number | null;
         output_price: number | null;
         retention_days: number;
+        operator_wait_hours: number;
       }>(await api("/settings"));
       setSettings({
         dailyAiLimit: s.daily_ai_limit,
@@ -699,7 +753,11 @@ export function OperationsPanel({
         inputPrice: s.input_price,
         outputPrice: s.output_price,
         retentionDays: s.retention_days,
+        operatorWaitHours: s.operator_wait_hours,
       });
+      setDestinations(
+        await read<typeof destinations>(await api("/notifications/destinations")),
+      );
     }
   }
   useEffect(() => {
@@ -1249,6 +1307,29 @@ export function OperationsPanel({
         <>
           <Card className="max-w-3xl shadow-none">
             <CardHeader>
+              <CardTitle className="text-base">External notifications</CardTitle>
+              <CardDescription>
+                Webhook destinations come from the deployment secret
+                NOTIFICATION_WEBHOOKS, never from this page. Only the host is shown.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-2 text-sm">
+              {destinations.length ? (
+                destinations.map((d) => (
+                  <p key={d.destination}>
+                    {d.host} ({d.format}): {d.sent} sent, {d.pending} pending,{" "}
+                    {d.failed} failed
+                  </p>
+                ))
+              ) : (
+                <p className="text-muted-foreground">
+                  No destination configured. Notifications stay in-app.
+                </p>
+              )}
+            </CardContent>
+          </Card>
+          <Card className="max-w-3xl shadow-none">
+            <CardHeader>
               <CardTitle className="text-base">
                 Inference & retention controls
               </CardTitle>
@@ -1311,6 +1392,24 @@ export function OperationsPanel({
                         setSettings({
                           ...settings,
                           retentionDays: +e.target.value,
+                        })
+                      }
+                    />
+                  </Field>
+                  <Field
+                    label="Operator wait before follow-up (hours)"
+                    id="operator-wait-hours"
+                  >
+                    <Input
+                      id="operator-wait-hours"
+                      type="number"
+                      min={1}
+                      max={168}
+                      value={settings.operatorWaitHours ?? 24}
+                      onChange={(e) =>
+                        setSettings({
+                          ...settings,
+                          operatorWaitHours: +e.target.value,
                         })
                       }
                     />
@@ -1478,6 +1577,32 @@ export function OperationsPanel({
             </CardContent>
           </Card>
         </>
+      )}
+    </div>
+  );
+}
+
+// Post-verification comparison with the pre-incident baseline, plus what the probes
+// cannot show. Informational only; resolution still needs the healthy runs.
+function RecoveryReport({ report }: { report: NonNullable<Detail["recovery"]> }) {
+  const ms = (v: number | null) => (v === null ? "n/a" : `${v} ms`);
+  return (
+    <div className="space-y-1 rounded-md border p-2 text-xs" aria-label="Recovery comparison">
+      <p>
+        Healthy runs: {report.healthyRuns}/{report.requiredRuns}. Median latency{" "}
+        {ms(report.recovery.medianLatencyMs)} vs baseline{" "}
+        {ms(report.baseline.medianLatencyMs)}
+        {report.withinBaseline === false ? " (above baseline)" : ""}.
+      </p>
+      {report.telemetry.available.length > 0 && (
+        <p>Telemetry since verification: {report.telemetry.available.join(", ")}.</p>
+      )}
+      {report.disclosures.length > 0 && (
+        <ul className="list-disc pl-4 text-muted-foreground">
+          {report.disclosures.map((d) => (
+            <li key={d}>{d}</li>
+          ))}
+        </ul>
       )}
     </div>
   );

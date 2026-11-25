@@ -4,6 +4,7 @@ import { Operations } from "./operations";
 import { reconcile, reconcileStalled } from "./dispatch";
 import { samplesFor } from "./fixtures";
 import { syncIntegration } from "./providers";
+import { deliverNotifications } from "./notify";
 import type { Env } from "./types";
 import type { Monitor } from "./contracts";
 
@@ -68,7 +69,7 @@ export function publicIPv6(value: string) {
   if (head === 0x3fff && next <= 0x0fff) return false; // documentation 3fff::/20
   return true;
 }
-async function validateDNS(hostname: string, fetcher: typeof fetch) {
+export async function validateDNS(hostname: string, fetcher: typeof fetch) {
   // Reject private resolutions. Only operator-owned immutable URL allowlists are permitted;
   // production Worker must be originless (no same-zone origin route/private service binding).
   for (const type of ["A", "AAAA"]) {
@@ -335,6 +336,8 @@ async function maintainScope(env: Env, repo: Operations) {
     await reconcileStalled(env, scope);
     await repo.purge();
     await expireConversations(env, repo);
+    await repo.expireOperatorWaits();
+    await deliverNotifications(env, repo);
     const contexts = (
       await repo
         .stmt(

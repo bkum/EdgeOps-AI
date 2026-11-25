@@ -7,7 +7,7 @@ import { demoRunSchema } from "./contracts";
 import { Operations } from "./operations";
 import { operationsApi } from "./api-operations";
 import { schedule } from "./probes";
-import { Conflict, Repository } from "./repository";
+import { Conflict, NotFound, Repository } from "./repository";
 import { reconcile } from "./dispatch";
 import { apiError } from "./http";
 import { SCOPE, type Env, type Principal } from "./types";
@@ -195,6 +195,13 @@ app.get("/api/v1/incidents/:id", async (c) => {
           c.req.param("id"),
           raw.incident.service_id,
         ),
+        recommendations: await r.recommendations(c.req.param("id")),
+        // The report saved at resolution, otherwise the live comparison.
+        recovery: raw.incident.recovery_report
+          ? JSON.parse(raw.incident.recovery_report)
+          : ["verifying", "resolved"].includes(raw.incident.status)
+            ? await r.recoveryReport(c.req.param("id"))
+            : null,
       }
     : null;
   return data
@@ -298,6 +305,8 @@ app.notFound((c) =>
 );
 app.get("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 app.onError((error, c) => {
+  if (error instanceof NotFound)
+    return apiError(c, 404, "not_found", "Resource not found in this environment");
   const validation =
     error instanceof z.ZodError || error instanceof SyntaxError;
   const conflict = error instanceof Conflict;

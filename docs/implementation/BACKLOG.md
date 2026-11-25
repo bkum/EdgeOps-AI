@@ -27,7 +27,7 @@ Core operational behavior is implemented and locally validated; external provide
 | B20 | P0 | **Partial:** pinned setup, CI configuration, successful fresh-source installation/test/build rehearsal, isolated migration/browser checks, tested local SQL backup/restore, reproducible browser demo recording and runbook; hosted CI result, remote restore rehearsal, narrated submission recording and submission review remain | B17–B19 |
 | B21 | P1 | **Management-health adapter implemented:** restricted Supabase database/auth service health; richer auth aggregates await a supported approved source and credentials | B19 |
 | B22 | P1 | **Implemented:** counters/meters, explicit cost estimates and deployment comparisons with distinct revisions, configured environment, bounded before/after probe windows, minimum distinct runs, failure-rate/p95 changes, provenance and unavailable states | B09,B19 |
-| B23 | P1 | **In-app notifications implemented/idempotent:** external opt-in notification delivery remains optional and unconfigured | B14 |
+| B23 | P1 | **Notifications implemented:** in-app (idempotent) plus opt-in webhook delivery from the `NOTIFICATION_WEBHOOKS` secret, deduplicated per destination with bounded retries | B14 |
 | B24 | P1 | **Deferred by design:** scoped confirmed-history retrieval works without semantic search; add Vectorize/R2 only after measured need | B16 |
 | B25 | P2 | **Later scope:** WAF, certificate/DNS collection, OTel and approval-based remediation proposals remain outside this operational MVP | Pilot feedback |
 

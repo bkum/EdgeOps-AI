@@ -47,7 +47,7 @@ export class InvestigationWorkflow extends WorkflowEntrypoint<
         { retries: { limit: 2, delay: "2 seconds" }, timeout: "15 seconds" },
         () => repo.saveEvidence(incidentId, attempt),
       );
-      const result = await step.do(
+      const first = await step.do(
         "bounded-summary",
         { retries: { limit: 0, delay: "1 second" }, timeout: "75 seconds" },
         async () => {
@@ -73,6 +73,50 @@ export class InvestigationWorkflow extends WorkflowEntrypoint<
           );
         },
       );
+      // Step 5: at most one round of server-defined follow-up queries the summary asked
+      // for, then one final summary that may cite them. Each step result is persisted by
+      // Workflows, so a retry reuses it instead of querying or calling the model again.
+      // If the refined summary is unavailable, the first summary stands.
+      let result: typeof first & { followUps?: unknown } = first;
+      const requested =
+        "finding" in first && first.finding?.followUps?.length ? first.finding.followUps : [];
+      if (requested.length) {
+        const ran = await step.do(
+          "follow-up-queries",
+          { retries: { limit: 1, delay: "2 seconds" }, timeout: "30 seconds" },
+          () => repo.followUpEvidence(incidentId, attempt, requested),
+        );
+        const refined = ran.length
+          ? await step.do(
+              "refined-summary",
+              { retries: { limit: 0, delay: "1 second" }, timeout: "75 seconds" },
+              async () => {
+                const saved = await repo.incident(incidentId);
+                if (saved?.run?.status === "cancelled" || saved?.run?.attempt !== attempt)
+                  return null;
+                return summarize(
+                  this.env,
+                  repo,
+                  `investigation:${incidentId}:a${attempt}:r2`,
+                  saved.evidence,
+                  { final: true },
+                );
+              },
+            )
+          : null;
+        result =
+          refined?.status === "completed"
+            ? { ...refined, followUps: { requested, ran, refined: true } }
+            : {
+                ...first,
+                followUps: {
+                  requested,
+                  ran,
+                  refined: false,
+                  reason: refined && "reason" in refined ? refined.reason : "not_run",
+                },
+              };
+      }
       // D1 write retries reuse the Workflow's persisted result, never another model call.
       await step.do(
         "persist-summary",

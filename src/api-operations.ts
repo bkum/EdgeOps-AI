@@ -9,7 +9,10 @@ import {
   knowledgeSchema,
   integrationSchema,
   settingsSchema,
+  recommendationDispositionSchema,
 } from "./contracts";
+import { pageQuerySchema, type PageKind } from "./pagination";
+import { destinationsStatus } from "./notify";
 import { approvedURL, runMonitor } from "./probes";
 import { syncIntegration } from "./providers";
 import type { Env, Principal } from "./types";
@@ -24,6 +27,14 @@ export const operationsApi = new Hono<{
 const repo = (c: { env: Env; get: (k: "principal") => Principal }) =>
   new Operations(c.env.DB, c.get("principal").scope);
 const data = (value: unknown) => ({ data: value });
+// `data` stays the array of items; `meta.nextCursor` is set when more rows exist.
+const listed = async (
+  c: { env: Env; get: (k: "principal") => Principal; req: { query: () => Record<string, string> } },
+  kind: PageKind,
+) => {
+  const page = await repo(c).page(kind, pageQuerySchema.parse(c.req.query()));
+  return { data: page.items, meta: { nextCursor: page.nextCursor } };
+};
 
 async function invalidateConversations(env: Env, scope: string) {
   const records = (
@@ -161,14 +172,31 @@ operationsApi.post("/incidents/:id/operator-actions", async (c) => {
     c.executionCtx.waitUntil(reconcile(c.env, c.get("principal").scope));
   return result ? c.json(data(result)) : c.notFound();
 });
+operationsApi.get("/incidents", async (c) => c.json(await listed(c, "incidents")));
+operationsApi.get("/incidents/:id/recommendations", async (c) =>
+  (await repo(c).incident(c.req.param("id")))
+    ? c.json(data(await repo(c).recommendations(c.req.param("id"))))
+    : c.notFound(),
+);
+operationsApi.patch("/incidents/:id/recommendations/:recommendationId", async (c) => {
+  const input = recommendationDispositionSchema.parse(await c.req.json());
+  return c.json(
+    data(
+      await repo(c).disposeRecommendation(
+        c.req.param("id"),
+        c.req.param("recommendationId"),
+        input,
+        c.get("principal").actor,
+      ),
+    ),
+  );
+});
 operationsApi.get("/incidents/:id/events", async (c) =>
   (await repo(c).incident(c.req.param("id")))
     ? c.json(data(await repo(c).events(c.req.param("id"))))
     : c.notFound(),
 );
-operationsApi.get("/knowledge", async (c) =>
-  c.json(data(await repo(c).memory())),
-);
+operationsApi.get("/knowledge", async (c) => c.json(await listed(c, "knowledge")));
 operationsApi.patch("/knowledge/:id", async (c) => {
   const input = knowledgeSchema.parse(await c.req.json());
   await repo(c).updateMemory(
@@ -244,9 +272,7 @@ operationsApi.post("/integrations/:provider/:serviceId/sync", async (c) => {
     );
   return c.json(data(await syncIntegration(c.env, r, integration)));
 });
-operationsApi.get("/telemetry", async (c) =>
-  c.json(data(await repo(c).telemetry())),
-);
+operationsApi.get("/telemetry", async (c) => c.json(await listed(c, "telemetry")));
 operationsApi.get("/deployments/comparisons", async (c) =>
   c.json(data(await deploymentComparisons(repo(c)))),
 );
@@ -263,35 +289,22 @@ operationsApi.patch("/settings", async (c) => {
   );
   return c.json(data({ saved: true }));
 });
-operationsApi.get("/notifications", async (c) =>
-  c.json(data(await repo(c).notifications())),
+operationsApi.get("/notifications", async (c) => c.json(await listed(c, "notifications")));
+// Configured external destinations, by host only: webhook URLs are credentials.
+operationsApi.get("/notifications/destinations", async (c) =>
+  c.json(data(await destinationsStatus(c.env, repo(c)))),
 );
 operationsApi.post("/notifications/:id/read", async (c) => {
   z.object({})
     .strict()
     .parse(await c.req.json());
-  await repo(c)
-    .stmt(
-      "UPDATE notifications SET read_at=?2 WHERE scope=?1 AND id=?3",
-      new Date().toISOString(),
-      c.req.param("id"),
-    )
-    .run();
-  return c.json(data({ read: true }));
+  return c.json(data(await repo(c).markNotificationRead(c.req.param("id"))));
 });
-operationsApi.get("/audit", async (c) =>
-  c.json(
-    data(
-      (
-        await repo(c)
-          .stmt(
-            "SELECT action,outcome,created_at FROM audit_logs WHERE scope=? ORDER BY created_at DESC LIMIT 100",
-          )
-          .all()
-      ).results,
-    ),
-  ),
-);
+operationsApi.get("/audit", async (c) => {
+  const page = await listed(c, "audit");
+  // The row ID is only the cursor key; the response shape is unchanged.
+  return c.json({ ...page, data: page.data.map(({ id: _, ...row }) => row) });
+});
 operationsApi.get("/export", async (c) => {
   const r = repo(c);
   await r.audit(c.get("principal").actor, "scope.export", "ok");

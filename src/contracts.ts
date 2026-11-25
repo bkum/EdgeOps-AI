@@ -89,6 +89,8 @@ export const settingsSchema = z
     inputPrice: z.number().min(0).max(10000).nullable(),
     outputPrice: z.number().min(0).max(10000).nullable(),
     retentionDays: z.number().int().min(1).max(180),
+    // Hours an incident may wait for an operator before it is flagged for follow-up.
+    operatorWaitHours: z.number().int().min(1).max(168).optional(),
   })
   .strict();
 export const environmentSchema = z
@@ -146,3 +148,11 @@ export interface Telemetry {
   fetched_at: string;
   expires_at: string;
 }
+
+export const recommendationDispositionSchema = z
+  .object({
+    disposition: z.enum(["proposed", "accepted", "rejected", "done"]),
+    expectedVersion: z.number().int().positive(),
+    note: z.string().trim().max(500).optional(),
+  })
+  .strict();

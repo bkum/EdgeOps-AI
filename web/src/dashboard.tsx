@@ -107,6 +107,25 @@ export type Detail = {
   run: Investigation | null;
   evidence: Evidence[];
   recovered?: boolean;
+  recommendations?: {
+    id: string;
+    action: string;
+    rationale: string | null;
+    evidence_ids: string[];
+    disposition: string;
+    disposition_by: string | null;
+    version: number;
+  }[];
+  recovery?: {
+    healthyRuns: number;
+    requiredRuns: number;
+    baseline: { samples: number; medianLatencyMs: number | null };
+    recovery: { samples: number; medianLatencyMs: number | null };
+    latencyRatio: number | null;
+    withinBaseline: boolean | null;
+    telemetry: { available: string[]; unavailable: string[] };
+    disclosures: string[];
+  } | null;
   events?: {
     id: string;
     action: string;
@@ -303,6 +322,7 @@ function Investigation({ detail }: { detail?: Detail }) {
         mode?: string;
         finding?: Finding;
         reason?: string;
+        followUps?: { ran?: string[]; refined?: boolean };
       } | null>(detail.run.result, { reason: "unreadable_result" })
     : null;
   if (!detail)
@@ -332,6 +352,14 @@ function Investigation({ detail }: { detail?: Detail }) {
                 : "AI summary — operator review required"}
             </h3>
             <p className="text-muted-foreground">{result.finding.summary}</p>
+            {!!result.followUps?.ran?.length && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                Follow-up queries: {result.followUps.ran.join(", ")}
+                {result.followUps.refined
+                  ? " (summary refined with their results)"
+                  : " (refined summary unavailable; first summary shown)"}
+              </p>
+            )}
           </div>
           <div>
             <h3 className="mb-2 font-semibold">Observations</h3>
@@ -353,7 +381,16 @@ function Investigation({ detail }: { detail?: Detail }) {
             ))}
           </div>
           {[
-            ["Manual next steps", result.finding.recommendations],
+            [
+              "Manual next steps",
+              result.finding.recommendations.map((r) =>
+                typeof r === "string"
+                  ? r
+                  : r.rationale
+                    ? `${r.action} — ${r.rationale}`
+                    : r.action,
+              ),
+            ],
             ["Unknowns", result.finding.unknowns],
           ].map(([title, items]) => (
             <div key={title as string}>

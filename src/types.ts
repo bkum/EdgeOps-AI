@@ -13,8 +13,12 @@ export interface Env {
   CLOUDFLARE_TELEMETRY_TOKEN?: string;
   GITHUB_READ_TOKEN?: string;
   SUPABASE_READ_TOKEN?: string;
+  // Secret JSON [{"scope","url","format"?: "json"|"slack"}]: external notification webhooks.
+  NOTIFICATION_WEBHOOKS?: string;
   MODE: string;
   AI_MODE: string;
+  // "on" streams remote assistant answers as validated provisional text (opt-in).
+  AI_STREAMING?: string;
   DAILY_AI_LIMIT: string;
   LOCAL_API_TOKEN?: string;
   ACCESS_TEAM_DOMAIN: string;
@@ -44,6 +48,7 @@ export interface Incident {
   resolved_at?: string | null;
   cause_status?: string;
   confirmed_cause?: string | null;
+  recovery_report?: string | null;
 }
 export interface Investigation {
   id: string;

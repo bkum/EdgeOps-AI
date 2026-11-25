@@ -33,6 +33,16 @@ describe("D1 state ownership and replay", () => {
       (await readFile(
         new URL("../migrations/0003_conversation_activity.sql", import.meta.url),
         "utf8",
+      )) +
+      "\n" +
+      (await readFile(
+        new URL("../migrations/0004_investigation_history.sql", import.meta.url),
+        "utf8",
+      )) +
+      "\n" +
+      (await readFile(
+        new URL("../migrations/0005_recommendations_delivery.sql", import.meta.url),
+        "utf8",
       ));
     // D1 exec accepts one statement per line; preserve actual schema rather than a mock.
     await db.exec(sql.replace(/\n/g, " "));

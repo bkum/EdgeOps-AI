@@ -224,6 +224,7 @@ function App() {
       const parser = createSseParser((event) => {
         if (event.error) throw new Error(event.error);
         if (event.progress) setChatProgress(event.progress);
+        if (event.retract) setStreamingText("");
         if (event.delta) setStreamingText((t) => t + event.delta);
         if (event.messages) {
           completed = true;

@@ -27,3 +27,5 @@ Proposed starting limits: 10 tool calls and 5 model turns per investigation, 24-
 Response schema: summary; observations with evidence IDs; hypotheses with support/contradiction and confidence rationale; recommended manual checks/actions; unknowns; recovery criteria. Validate cited IDs belong to this run or authorized historical records. Label inferred causality; only explicit operator confirmation produces confirmed knowledge. Do not expose hidden reasoning or request it; store concise findings and tool audit.
 
 Prompt instructions define role, scope, tool rules, budgets, evidence requirements and distrust of external text. Operational evidence is data and cannot override those rules. Pin and version prompts with evaluations. Native model tool calling must be exercised in the foundation spike; if unavailable use a validated structured tool-selection protocol, never unrestricted text execution.
+
+Investigation follow-ups (implemented): one round of at most two server-defined queries requested by name, then one final summary. That is two model turns per attempt, inside the five-turn limit above. See INCIDENT_WORKFLOW step 5.

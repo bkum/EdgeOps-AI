@@ -49,6 +49,29 @@ export function safeText(value: string, limit = 2000): string {
     .replace(/[<>]/g, "")
     .slice(0, limit);
 }
+// The deployment's own secrets are known exactly, so model output is also scrubbed by
+// value: pattern redaction cannot recognise every credential format.
+const secretNames = [
+  "LOCAL_API_TOKEN",
+  "CLOUDFLARE_TELEMETRY_TOKEN",
+  "GITHUB_READ_TOKEN",
+  "SUPABASE_READ_TOKEN",
+] as const;
+export function withoutSecrets(
+  text: string,
+  env: Partial<Record<(typeof secretNames)[number], string>>,
+) {
+  let result = text;
+  for (const name of secretNames) {
+    const secret = env[name];
+    if (secret && secret.length >= 8)
+      result = result.split(secret).join("[REDACTED]");
+  }
+  // Webhook URLs carry their credential in the path; scrub each configured one.
+  for (const url of webhookURLs((env as { NOTIFICATION_WEBHOOKS?: string }).NOTIFICATION_WEBHOOKS))
+    result = result.split(url).join("[REDACTED]");
+  return result;
+}
 export async function boundedJson(
   response: Response,
   cap = 65536,
@@ -80,5 +103,18 @@ export async function boundedJson(
     return JSON.parse(text);
   } finally {
     await reader.cancel().catch(() => {});
+  }
+}
+
+function webhookURLs(raw?: string): string[] {
+  try {
+    const parsed = JSON.parse(raw ?? "[]") as unknown;
+    return Array.isArray(parsed)
+      ? parsed
+          .map((d) => (d && typeof d === "object" && "url" in d ? String(d.url) : ""))
+          .filter((u) => u.length >= 8)
+      : [];
+  } catch {
+    return [];
   }
 }

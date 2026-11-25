@@ -1,8 +1,19 @@
-import { detect, type Scenario, type Sample } from "./domain";
+import {
+  detect,
+  FOLLOW_UPS,
+  MAX_FOLLOW_UPS,
+  type FollowUp,
+  recommendationSchema,
+  type Scenario,
+  type Sample,
+} from "./domain";
 import { samplesFor } from "./fixtures";
+import { safeText } from "./sanitize";
 import type { Evidence, Incident, Investigation } from "./types";
 
 export class Conflict extends Error {}
+// A resource that does not exist in the caller's environment (never says which).
+export class NotFound extends Error {}
 export class Repository {
   constructor(
     readonly db: D1Database,
@@ -293,8 +304,186 @@ export class Repository {
           ),
         );
     }
+    // Prior closed incidents of this service, operator-confirmed lessons first. They are
+    // persisted as evidence so the model may cite them and the operator sees what was used.
+    for (const prior of await this.incidentHistory(
+      detail.incident.service_id,
+      id,
+      detail.incident.opened_at,
+    ))
+      statements.push(
+        this.stmt(
+          "INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?,?,?)",
+          `${id}-history-${prior.incidentId}`,
+          id,
+          "incident-history",
+          JSON.stringify(prior),
+          prior.closedAt ?? prior.openedAt,
+          now,
+        ),
+      );
     await this.db.batch(statements);
     return (await this.incident(id))!.evidence;
+  }
+  // Runs the named follow-up queries for one attempt and persists each result as
+  // evidence, so a refined summary may cite it. Bounded: at most MAX_FOLLOW_UPS distinct
+  // known names; a stale or cancelled attempt writes nothing. Missing data is recorded
+  // as an explicit gap, never omitted.
+  async followUpEvidence(id: string, expectedAttempt: number, requested: readonly string[]) {
+    const names = [...new Set(requested)]
+      .filter((n): n is FollowUp => (FOLLOW_UPS as readonly string[]).includes(n))
+      .slice(0, MAX_FOLLOW_UPS);
+    const detail = await this.incident(id);
+    if (!detail?.run || !names.length) return [];
+    if (detail.run.attempt !== expectedAttempt || detail.run.status === "cancelled") return [];
+    const { incident } = detail;
+    const now = new Date().toISOString();
+    const results: { name: FollowUp; summary: unknown }[] = [];
+    for (const name of names) {
+      if (name === "probe-history-24h") {
+        const since = new Date(Date.parse(incident.opened_at) - 86400_000).toISOString();
+        const rows = (
+          await this.stmt(
+            "SELECT status,latency_ms,recorded_at FROM health_checks WHERE scope=? AND service_id=? AND recorded_at>=? AND recorded_at<=? ORDER BY recorded_at LIMIT 500",
+            incident.service_id,
+            since,
+            now,
+          ).all<{ status: string; latency_ms: number; recorded_at: string }>()
+        ).results;
+        const healthy = rows.filter((r) => r.status === "healthy").map((r) => r.latency_ms).sort((a, b) => a - b);
+        const unhealthy = rows.filter((r) => r.status === "unhealthy");
+        results.push({
+          name,
+          summary: rows.length
+            ? {
+                window: { from: since, to: now },
+                samples: rows.length,
+                truncated: rows.length === 500,
+                counts: {
+                  healthy: healthy.length,
+                  unhealthy: unhealthy.length,
+                  unknown: rows.length - healthy.length - unhealthy.length,
+                },
+                medianHealthyLatencyMs: healthy.length ? healthy[Math.floor(healthy.length / 2)] : null,
+                firstUnhealthyAt: unhealthy[0]?.recorded_at ?? null,
+                lastUnhealthyAt: unhealthy.at(-1)?.recorded_at ?? null,
+              }
+            : { gap: "No probe samples in the 24 hours before and since the incident." },
+        });
+      }
+      if (name === "dependency-health") {
+        const deps = (
+          await this.stmt(
+            "SELECT depends_on FROM service_dependencies WHERE scope=? AND service_id=? ORDER BY depends_on LIMIT 5",
+            incident.service_id,
+          ).all<{ depends_on: string }>()
+        ).results;
+        const dependencies = [];
+        for (const { depends_on } of deps) {
+          const samples = (
+            await this.stmt(
+              "SELECT observed_at AS observedAt,status,latency_ms AS latencyMs FROM health_checks WHERE scope=? AND service_id=? ORDER BY recorded_at DESC,rowid DESC LIMIT 5",
+              depends_on,
+            ).all<Sample>()
+          ).results;
+          dependencies.push({
+            serviceId: depends_on,
+            health: detect(samples),
+            unhealthySamples: samples.filter((s) => s.status === "unhealthy").length,
+            samples: samples.length,
+            latestAt: samples[0]?.observedAt ?? null,
+          });
+        }
+        results.push({
+          name,
+          summary: dependencies.length
+            ? { dependencies }
+            : { gap: "The service has no registered dependencies." },
+        });
+      }
+      if (name === "recent-deployments" || name === "worker-logs") {
+        const kind = name === "recent-deployments" ? "deployments" : "logs";
+        const row = await this.stmt(
+          "SELECT provider,status,summary,fetched_at FROM telemetry WHERE scope=? AND service_id=? AND kind=? AND expires_at>? ORDER BY fetched_at DESC LIMIT 1",
+          incident.service_id,
+          kind,
+          now,
+        ).first<{ provider: string; status: string; summary: string; fetched_at: string }>();
+        let data: unknown = null;
+        try {
+          data = row ? JSON.parse(row.summary) : null;
+        } catch {
+          data = null;
+        }
+        results.push({
+          name,
+          summary: row && data !== null
+            ? { provider: row.provider, status: row.status, fetchedAt: row.fetched_at, data }
+            : { gap: `No current ${kind} telemetry for this service.` },
+        });
+      }
+    }
+    // Same attempt guard as the batch: a retry that started meanwhile writes nothing.
+    const guard = `EXISTS(SELECT 1 FROM investigations WHERE scope=?1 AND incident_id=?2 AND attempt=?3 AND status<>'cancelled')`;
+    await this.db.batch(
+      results.map((r) =>
+        this.stmt(
+          `INSERT OR IGNORE INTO evidence(scope,id,investigation_id,provider,summary,observed_at,fetched_at) SELECT ?1,?4,?2,?5,?6,?7,?7 WHERE ${guard}`,
+          id,
+          expectedAttempt,
+          `${id}-followup-${r.name}`,
+          `follow-up:${r.name}`,
+          JSON.stringify(r.summary).length <= 8000
+            ? JSON.stringify(r.summary)
+            : JSON.stringify({ gap: "Follow-up result exceeded the evidence size limit." }),
+          now,
+        ),
+      ),
+    );
+    return names;
+  }
+  // Scoped history for one service. A lesson is only "operator-confirmed" while its
+  // knowledge entry exists; anything else is labeled unconfirmed (prior model output).
+  async incidentHistory(serviceId: string, excludeId: string, before: string, limit = 3) {
+    const rows = (
+      await this.stmt(
+        `SELECT i.id,i.status,i.opened_at,i.resolved_at,i.scenario,k.content AS lesson,k.confirmed_at,v.result FROM incidents i LEFT JOIN knowledge_entries k ON k.scope=i.scope AND k.incident_id=i.id LEFT JOIN investigations v ON v.scope=i.scope AND v.incident_id=i.id WHERE i.scope=?1 AND i.service_id=?2 AND i.id<>?3 AND i.status IN('resolved','dismissed') AND i.opened_at<=?4 ORDER BY (k.id IS NOT NULL) DESC,i.opened_at DESC LIMIT ?5`,
+        serviceId,
+        excludeId,
+        before,
+        Math.min(Math.max(limit, 1), 10),
+      ).all<{
+        id: string;
+        status: string;
+        opened_at: string;
+        resolved_at: string | null;
+        scenario: string;
+        lesson: string | null;
+        confirmed_at: string | null;
+        result: string | null;
+      }>()
+    ).results;
+    return rows.map((r) => {
+      let priorSummary: string | null = null;
+      try {
+        const summary = (JSON.parse(r.result ?? "null") as { finding?: { summary?: unknown } } | null)
+          ?.finding?.summary;
+        if (typeof summary === "string") priorSummary = safeText(summary, 500);
+      } catch {
+        priorSummary = null;
+      }
+      return {
+        incidentId: r.id,
+        outcome: r.status,
+        signal: r.scenario,
+        openedAt: r.opened_at,
+        closedAt: r.resolved_at,
+        confirmation: r.lesson ? ("operator-confirmed" as const) : ("unconfirmed" as const),
+        lesson: r.lesson ? safeText(r.lesson, 1000) : null,
+        lessonConfirmedAt: r.confirmed_at,
+        priorSummary: r.lesson ? null : priorSummary,
+      };
+    });
   }
   async reserveAI(id: string, limit: number) {
     const settings = await this.stmt(
@@ -342,10 +531,21 @@ export class Repository {
     status: "completed" | "partial",
     expectedAttempt = 1,
   ) {
+    const json = JSON.stringify(result);
+    const now = new Date().toISOString();
+    // Each recommendation of this attempt becomes a record the operator can accept,
+    // reject or mark done. Written only if this call's result is the one persisted, so
+    // a late or conflicting completion adds nothing; stable IDs make replays no-ops.
+    const finding = (result as { finding?: { recommendations?: unknown[] }; mode?: string } | null) ?? {};
+    const recommendations = (Array.isArray(finding.finding?.recommendations) ? finding.finding.recommendations : [])
+      .slice(0, 5)
+      .map((r) => recommendationSchema.safeParse(r))
+      .filter((r) => r.success)
+      .map((r) => r.data);
     await this.db.batch([
       this.stmt(
         `UPDATE investigations SET result = ?2, status = ?3, updated_at = ?4 WHERE scope = ?1 AND id = ?5 AND result IS NULL AND status<>'cancelled' AND attempt=?6`,
-        JSON.stringify(result),
+        json,
         status,
         new Date().toISOString(),
         id,
@@ -355,6 +555,21 @@ export class Repository {
         `UPDATE incidents SET status = 'awaiting_operator', version = version + 1 WHERE scope = ?1 AND id = ?2 AND status IN ('open','investigating') AND EXISTS(SELECT 1 FROM investigations WHERE scope=?1 AND incident_id=?2 AND status<>'cancelled' AND attempt=?3)`,
         id,
         expectedAttempt,
+      ),
+      ...recommendations.map((r, position) =>
+        this.stmt(
+          `INSERT OR IGNORE INTO recommendations(scope,id,incident_id,attempt,position,action,rationale,evidence_ids,source,created_at) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 WHERE EXISTS(SELECT 1 FROM investigations WHERE scope=?1 AND incident_id=?3 AND attempt=?4 AND status<>'cancelled' AND result=?11)`,
+          `${id}-a${expectedAttempt}-r${position + 1}`,
+          id,
+          expectedAttempt,
+          position + 1,
+          safeText(typeof r === "string" ? r : r.action, 500),
+          typeof r === "string" || !r.rationale ? null : safeText(r.rationale, 500),
+          JSON.stringify(typeof r === "string" ? [] : (r.evidenceIds ?? [])),
+          typeof finding.mode === "string" ? finding.mode.slice(0, 20) : "unknown",
+          now,
+          json,
+        ),
       ),
     ]);
   }

@@ -4,6 +4,20 @@ import { boundedJson, safeText } from "./sanitize";
 import type { Env } from "./types";
 import type { Integration } from "./contracts";
 
+const safeReasons = [
+  "disabled",
+  "credential_missing",
+  "resource_not_approved",
+  "rate_limited",
+  "denied",
+  "provider_unavailable",
+  "provider_request_budget",
+  "response_too_large",
+  "empty_response",
+  "resource_mismatch",
+  "partial_provider_response",
+];
+
 const metric = z.object({
   sum: z.object({
     requests: z.number().nonnegative(),
@@ -119,12 +133,11 @@ export async function syncIntegration(
         signal: AbortSignal.timeout(5000),
       });
       if ((response.status === 429 || response.status >= 500) && attempt < 2) {
+        // Retry-After in seconds (including 0); a missing or date-form value waits 1 s.
+        const seconds = Number(response.headers.get("retry-after") ?? "1");
         const delay = Math.min(
           2000,
-          Math.max(
-            100,
-            Number(response.headers.get("retry-after") ?? "1") * 1000 || 1000,
-          ),
+          Math.max(100, Number.isFinite(seconds) ? seconds * 1000 : 1000),
         );
         await response.body?.cancel();
         await new Promise((resolve) => setTimeout(resolve, delay));
@@ -352,17 +365,13 @@ export async function syncIntegration(
     await repo.audit("provider", "integration.sync", "ok");
     return { status: "ok", items: output.length };
   } catch (error) {
+    // Only fixed reason codes are stored; provider messages never reach D1 or the UI.
     const reason =
-      error instanceof Error &&
-      [
-        "disabled",
-        "credential_missing",
-        "resource_not_approved",
-        "rate_limited",
-        "denied",
-      ].includes(error.message)
-        ? error.message
-        : "provider_unavailable_or_schema_mismatch";
+      error instanceof z.ZodError || error instanceof SyntaxError
+        ? "schema_mismatch"
+        : error instanceof Error && safeReasons.includes(error.message)
+          ? error.message
+          : "provider_unavailable";
     await repo
       .stmt(
         "UPDATE integrations SET status=?2,last_checked_at=?3,safe_error=?4 WHERE scope=?1 AND provider=?5 AND service_id=?6",

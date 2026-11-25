@@ -26,6 +26,8 @@ describe("bounded load, grounded failures and deployment correlation", () => {
       "0001_foundation.sql",
       "0002_operations.sql",
       "0003_conversation_activity.sql",
+      "0004_investigation_history.sql",
+      "0005_recommendations_delivery.sql",
     ])
       await repo.db.exec(
         (

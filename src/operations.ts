@@ -1,4 +1,4 @@
-import { Repository, Conflict } from "./repository";
+import { Repository, Conflict, NotFound } from "./repository";
 import { safeText } from "./sanitize";
 import {
   type ServiceInput,
@@ -10,6 +10,7 @@ import {
   type Integration,
 } from "./contracts";
 import type { Env } from "./types";
+import { decodeCursor, encodeCursor, PAGES, type PageKind } from "./pagination";
 
 export const MAX_SERVICES = 20;
 export const MAX_SCOPES = 50;
@@ -305,6 +306,7 @@ export class Operations extends Repository {
       return this.incident(id);
     }
     let next = status;
+    let recovery: string | null = null;
     if (input.action === "verify") {
       if (!["awaiting_operator", "investigating"].includes(status))
         throw new Conflict("Incident cannot enter verification");
@@ -318,6 +320,7 @@ export class Operations extends Repository {
           "Three consecutive successful probe runs after verification are required",
         );
       next = "resolved";
+      recovery = JSON.stringify(await this.recoveryReport(id));
     }
     if (input.action === "dismiss") {
       if (["resolved", "dismissed"].includes(status))
@@ -350,7 +353,7 @@ export class Operations extends Repository {
         input.expectedVersion,
       ),
       this.stmt(
-        `UPDATE incidents SET status=?2,version=version+1,resolved_at=?3,cause_status=?4,confirmed_cause=?5 WHERE scope=?1 AND id=?6 AND version=?7 AND EXISTS(SELECT 1 FROM incident_events WHERE scope=?1 AND id=?8)`,
+        `UPDATE incidents SET status=?2,version=version+1,resolved_at=?3,cause_status=?4,confirmed_cause=?5,recovery_report=COALESCE(?9,recovery_report) WHERE scope=?1 AND id=?6 AND version=?7 AND EXISTS(SELECT 1 FROM incident_events WHERE scope=?1 AND id=?8)`,
         next,
         next === "resolved" || next === "dismissed" ? now : null,
         next === "resolved" && input.cause ? "confirmed" : "unknown",
@@ -358,6 +361,7 @@ export class Operations extends Repository {
         id,
         input.expectedVersion,
         key,
+        recovery,
       ),
       // Closing or cancelling stops further diagnostic work: a running Workflow sees
       // the cancelled run and skips inference, and an undispatched run is withdrawn.
@@ -422,6 +426,136 @@ export class Operations extends Repository {
     ).results;
     return rows.length === 3 && rows.every((r) => r.healthy === 1);
   }
+  // Compares the post-verification probe runs with the healthy pre-incident baseline and
+  // discloses what the probes cannot show. Informational: resolution still requires the
+  // three healthy runs, and only the operator confirms a cause.
+  async recoveryReport(id: string) {
+    const detail = await this.incident(id);
+    if (!detail) return null;
+    const { incident } = detail;
+    const verify = await this.stmt(
+      "SELECT created_at FROM incident_events WHERE scope=? AND incident_id=? AND action='verify' ORDER BY created_at DESC LIMIT 1",
+      id,
+    ).first<{ created_at: string }>();
+    const median = (values: number[]) => {
+      if (!values.length) return null;
+      const sorted = [...values].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+    };
+    const baselineRows = (
+      await this.stmt(
+        "SELECT latency_ms FROM health_checks WHERE scope=? AND service_id=? AND status='healthy' AND recorded_at<? ORDER BY recorded_at DESC LIMIT 20",
+        incident.service_id,
+        incident.opened_at,
+      ).all<{ latency_ms: number }>()
+    ).results;
+    const runs = verify
+      ? (
+          await this.stmt(
+            "SELECT request_key FROM health_checks WHERE scope=? AND service_id=? AND recorded_at>? GROUP BY request_key ORDER BY MAX(recorded_at) DESC LIMIT 3",
+            incident.service_id,
+            verify.created_at,
+          ).all<{ request_key: string }>()
+        ).results
+      : [];
+    const recoveryRows = runs.length
+      ? (
+          await this.stmt(
+            `SELECT status,latency_ms FROM health_checks WHERE scope=? AND service_id=? AND recorded_at>? AND request_key IN(${runs.map(() => "?").join(",")})`,
+            incident.service_id,
+            verify!.created_at,
+            ...runs.map((r) => r.request_key),
+          ).all<{ status: string; latency_ms: number }>()
+        ).results
+      : [];
+    const telemetry = verify
+      ? (
+          await this.stmt(
+            "SELECT kind,status FROM telemetry WHERE scope=? AND service_id=? AND fetched_at>? ORDER BY fetched_at DESC LIMIT 20",
+            incident.service_id,
+            verify.created_at,
+          ).all<{ kind: string; status: string }>()
+        ).results
+      : [];
+    const baseline = median(baselineRows.map((r) => r.latency_ms));
+    const current = median(
+      recoveryRows.filter((r) => r.status === "healthy").map((r) => r.latency_ms),
+    );
+    const ratio = baseline && current !== null ? Math.round((current / baseline) * 100) / 100 : null;
+    const disclosures: string[] = [];
+    if (!verify) disclosures.push("Verification has not been requested yet.");
+    if (baseline === null)
+      disclosures.push("No healthy probe samples exist before the incident, so latency was not compared with a baseline.");
+    else if (ratio !== null && ratio > 1.5)
+      disclosures.push(`Latency after recovery (${current} ms) is above the pre-incident baseline (${baseline} ms).`);
+    const available = [...new Set(telemetry.filter((t) => t.status !== "unavailable").map((t) => t.kind))];
+    const unavailable = [...new Set(telemetry.filter((t) => t.status === "unavailable").map((t) => t.kind))];
+    if (!telemetry.length)
+      disclosures.push("No provider telemetry was collected after verification; recovery is based on probes only.");
+    else if (unavailable.length)
+      disclosures.push(`Telemetry unavailable after verification: ${unavailable.join(", ")}.`);
+    if (
+      incident.scenario === "database-slowdown" ||
+      detail.evidence.some((e) => ["synthetic-database", "supabase"].includes(e.provider))
+    )
+      disclosures.push("Probe recovery shows transport health only; it does not confirm the database cause.");
+    return {
+      checkedAt: new Date().toISOString(),
+      verifiedAt: verify?.created_at ?? null,
+      requiredRuns: 3,
+      healthyRuns: await this.recovered(id, incident.service_id) ? 3 : runs.length,
+      baseline: { samples: baselineRows.length, medianLatencyMs: baseline },
+      recovery: { samples: recoveryRows.length, medianLatencyMs: current },
+      latencyRatio: ratio,
+      withinBaseline: ratio === null ? null : ratio <= 1.5,
+      telemetry: { available, unavailable },
+      disclosures,
+    };
+  }
+  // An incident left in awaiting_operator past the configured wait records that it needs
+  // manual follow-up (an event and a notification). It is never resolved or dismissed,
+  // and the version is unchanged so an operator's in-flight action still applies.
+  // Keyed on the incident version: one reminder per wait, again only after new activity.
+  async expireOperatorWaits(now = Date.now()) {
+    const hours = (await this.settings())?.operator_wait_hours ?? 24;
+    const cutoff = new Date(now - hours * 3600_000).toISOString();
+    const stamp = new Date(now).toISOString();
+    const waiting = (
+      await this.stmt(
+        `SELECT i.id,i.version FROM incidents i WHERE i.scope=?1 AND i.status='awaiting_operator' AND MAX(i.opened_at,COALESCE((SELECT MAX(created_at) FROM incident_events e WHERE e.scope=i.scope AND e.incident_id=i.id AND e.action<>'operator-wait-expired'),''),COALESCE((SELECT updated_at FROM investigations v WHERE v.scope=i.scope AND v.incident_id=i.id),''))<?2 ORDER BY i.opened_at LIMIT 50`,
+        cutoff,
+      ).all<{ id: string; version: number }>()
+    ).results;
+    let expired = 0;
+    for (const { id, version } of waiting) {
+      const event = `wait-expired-${id}-v${version}`;
+      const results = await this.db.batch([
+        this.stmt(
+          `INSERT OR IGNORE INTO incident_events(scope,id,incident_id,action,payload,actor,created_at,expected_version) SELECT ?1,?2,?3,'operator-wait-expired',?4,'system',?5,?6 FROM incidents WHERE scope=?1 AND id=?3 AND status='awaiting_operator' AND version=?6`,
+          event,
+          id,
+          JSON.stringify({
+            note: `No operator action for ${hours} h. The incident stays open and needs manual follow-up.`,
+            hours,
+          }),
+          stamp,
+          version,
+        ),
+        this.stmt(
+          `INSERT OR IGNORE INTO notifications(scope,id,incident_id,title,created_at) SELECT ?1,?2,?3,?4,?5 WHERE EXISTS(SELECT 1 FROM incident_events WHERE scope=?1 AND id=?6 AND created_at=?5)`,
+          `${id}-wait-v${version}`,
+          id,
+          `Incident waiting on an operator for over ${hours} h`,
+          stamp,
+          event,
+        ),
+      ]);
+      if (results[0].meta.changes) expired++;
+    }
+    if (expired) await this.audit("scheduler", "incident.operator-wait-expired", String(expired));
+    return expired;
+  }
   // An unhealthy probe run during verification sends the incident back to investigation
   // with a new attempt (fresh evidence, new Workflow ID), or to the operator when the
   // five-attempt cap is used up. Only a run recorded after the latest verify request
@@ -476,6 +610,15 @@ export class Operations extends Repository {
     content: string | null,
     actor: string,
   ) {
+    // Another environment's lesson is indistinguishable from a missing one (404);
+    // a stale version of this environment's lesson is a conflict (409).
+    const current = await this.stmt(
+      "SELECT version FROM knowledge_entries WHERE scope=? AND id=?",
+      id,
+    ).first<{ version: number }>();
+    if (!current) throw new NotFound("Knowledge entry not found");
+    if (current.version !== version)
+      throw new Conflict("Knowledge has changed; refresh before editing");
     const now = new Date().toISOString();
     const statements = [
       this.stmt(
@@ -554,18 +697,20 @@ export class Operations extends Repository {
       currency: string;
       price_checked_at: string | null;
       retention_days: number;
+      operator_wait_hours: number;
     }>();
   }
   async saveSettings(input: SettingsInput, actor: string) {
     await this.stmt(
       // The price date records when prices were last changed, not every settings save.
-      "UPDATE settings SET daily_ai_limit=?2,ai_enabled=?3,price_checked_at=CASE WHEN ?4 IS NULL AND ?5 IS NULL THEN NULL WHEN input_price IS ?4 AND output_price IS ?5 THEN price_checked_at ELSE ?6 END,input_price=?4,output_price=?5,retention_days=?7 WHERE scope=?1",
+      "UPDATE settings SET daily_ai_limit=?2,ai_enabled=?3,price_checked_at=CASE WHEN ?4 IS NULL AND ?5 IS NULL THEN NULL WHEN input_price IS ?4 AND output_price IS ?5 THEN price_checked_at ELSE ?6 END,input_price=?4,output_price=?5,retention_days=?7,operator_wait_hours=COALESCE(?8,operator_wait_hours) WHERE scope=?1",
       input.dailyAiLimit,
       Number(input.aiEnabled),
       input.inputPrice,
       input.outputPrice,
       new Date().toISOString(),
       input.retentionDays,
+      input.operatorWaitHours ?? null,
     ).run();
     await this.audit(actor, "settings.configure", "ok");
   }
@@ -650,10 +795,13 @@ export class Operations extends Repository {
     return {
       settings,
       services,
-      incidents: details.filter(Boolean).map((detail) => ({
-        ...detail,
-        events: shownEvents.filter((e) => e.incident_id === detail!.incident.id),
-      })),
+      incidents: await Promise.all(
+        details.filter(Boolean).map(async (detail) => ({
+          ...detail,
+          events: shownEvents.filter((e) => e.incident_id === detail!.incident.id),
+          recommendations: await this.recommendations(detail!.incident.id),
+        })),
+      ),
       knowledge: take(knowledge.results, limits.knowledge),
       telemetry: take(telemetry.results, limits.telemetry),
       truncated: {
@@ -663,6 +811,98 @@ export class Operations extends Repository {
         events: events.results.length > limits.events,
       },
     };
+  }
+  // Recommendations of the incident's current attempt, in the model's order.
+  async recommendations(incidentId: string) {
+    return (
+      await this.stmt(
+        "SELECT r.id,r.attempt,r.position,r.action,r.rationale,r.evidence_ids,r.source,r.disposition,r.disposition_note,r.disposition_by,r.disposition_at,r.version,r.created_at FROM recommendations r JOIN investigations v ON v.scope=r.scope AND v.incident_id=r.incident_id AND v.attempt=r.attempt WHERE r.scope=? AND r.incident_id=? ORDER BY r.position LIMIT 5",
+        incidentId,
+      ).all<{
+        id: string;
+        attempt: number;
+        position: number;
+        action: string;
+        rationale: string | null;
+        evidence_ids: string;
+        source: string;
+        disposition: string;
+        disposition_note: string | null;
+        disposition_by: string | null;
+        disposition_at: string | null;
+        version: number;
+        created_at: string;
+      }>()
+    ).results.map((r) => ({ ...r, evidence_ids: JSON.parse(r.evidence_ids) as string[] }));
+  }
+  // Records what the operator decided about a recommendation. It changes nothing else:
+  // EdgeOps never carries out an action. Foreign or unknown IDs are not found; a stale
+  // version is a conflict.
+  async disposeRecommendation(
+    incidentId: string,
+    id: string,
+    input: { disposition: string; expectedVersion: number; note?: string },
+    actor: string,
+  ) {
+    const result = await this.stmt(
+      "UPDATE recommendations SET disposition=?2,disposition_note=?3,disposition_by=?4,disposition_at=?5,version=version+1 WHERE scope=?1 AND incident_id=?6 AND id=?7 AND version=?8",
+      input.disposition,
+      input.note ? safeText(input.note, 500) : null,
+      actor,
+      new Date().toISOString(),
+      incidentId,
+      id,
+      input.expectedVersion,
+    ).run();
+    if (!result.meta.changes) {
+      const exists = await this.stmt(
+        "SELECT 1 AS x FROM recommendations WHERE scope=? AND incident_id=? AND id=?",
+        incidentId,
+        id,
+      ).first();
+      if (!exists) throw new NotFound("Recommendation not found");
+      throw new Conflict("Recommendation has changed; refresh before acting");
+    }
+    await this.audit(actor, `recommendation.${input.disposition}`, "ok");
+    return (await this.recommendations(incidentId)).find((r) => r.id === id) ?? null;
+  }
+  // Keyset pagination over a scoped list, newest first. The cursor is opaque, bound to
+  // the list it came from, and resumes strictly after the last row returned, so rows
+  // inserted meanwhile never shift or repeat a page.
+  async page(kind: PageKind, input: { cursor?: string; limit?: number } = {}) {
+    const config = PAGES[kind];
+    const limit = Math.min(Math.max(input.limit ?? config.limit, 1), 100);
+    const after = input.cursor ? decodeCursor(kind, input.cursor) : null;
+    const rows = (
+      await this.stmt(
+        `SELECT ${config.columns} FROM ${config.table} WHERE scope=?1${after ? ` AND (${config.sort},${config.id})<(?2,?3)` : ""} ORDER BY ${config.sort} DESC,${config.id} DESC LIMIT ${after ? "?4" : "?2"}`,
+        ...(after ? [after.key, after.id] : []),
+        limit + 1,
+      ).all<Record<string, string | number>>()
+    ).results;
+    const items = rows.slice(0, limit);
+    const last = items.at(-1);
+    return {
+      items,
+      nextCursor:
+        rows.length > limit && last
+          ? encodeCursor(kind, last[config.sortField], String(last[config.idField]))
+          : null,
+    };
+  }
+  // Idempotent: the first read time is kept. Unknown or foreign IDs are not found.
+  async markNotificationRead(id: string) {
+    await this.stmt(
+      "UPDATE notifications SET read_at=?2 WHERE scope=?1 AND id=?3 AND read_at IS NULL",
+      new Date().toISOString(),
+      id,
+    ).run();
+    const row = await this.stmt(
+      "SELECT read_at FROM notifications WHERE scope=? AND id=?",
+      id,
+    ).first<{ read_at: string }>();
+    if (!row) throw new NotFound("Notification not found");
+    return { read: true, readAt: row.read_at };
   }
   async notifications() {
     return (
@@ -730,6 +970,18 @@ export class Operations extends Repository {
       this.stmt(
         `DELETE FROM knowledge_entries WHERE scope=?1 AND incident_id IN(${closed})`,
         closedCutoff,
+      ),
+      this.stmt(
+        `DELETE FROM recommendations WHERE scope=?1 AND incident_id IN(${closed})`,
+        closedCutoff,
+      ),
+      this.stmt(
+        `DELETE FROM notification_deliveries WHERE scope=?1 AND notification_id IN(SELECT id FROM notifications WHERE scope=?1 AND incident_id IN(${closed}))`,
+        closedCutoff,
+      ),
+      this.stmt(
+        "DELETE FROM notification_deliveries WHERE scope=? AND state<>'pending' AND created_at<?",
+        new Date(Date.now() - 90 * 86400000).toISOString(),
       ),
       this.stmt(
         `DELETE FROM notifications WHERE scope=?1 AND incident_id IN(${closed})`,

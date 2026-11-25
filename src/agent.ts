@@ -91,7 +91,13 @@ export class OpsAgent extends Agent<Env> {
             (text) => send("progress", { progress: text }),
             prior,
             actor,
+            (text) => send("delta", { delta: text, provisional: true }),
           );
+          const provisional = "provisional" in answer && answer.provisional;
+          // Provisional text that will not become the saved answer is withdrawn first.
+          const retract = () => {
+            if (provisional) send("retract", { retract: true });
+          };
           const current = await repo
             .stmt("SELECT memory_revision FROM settings WHERE scope=?")
             .first<{ memory_revision: number }>();
@@ -113,6 +119,7 @@ export class OpsAgent extends Agent<Env> {
               this
                 .sql`INSERT INTO context_meta(key,value) VALUES('memory_revision',${String(current?.memory_revision ?? 0)}) ON CONFLICT(key) DO UPDATE SET value=excluded.value`;
             }
+            retract();
             send("conversation", {
               messages: this.history(),
               status: "context_changed",
@@ -125,11 +132,14 @@ export class OpsAgent extends Agent<Env> {
             .sql`INSERT INTO messages(role,content,created_at) VALUES('assistant',${answer.text},${finished})`;
           this
             .sql`DELETE FROM messages WHERE id NOT IN(SELECT id FROM messages ORDER BY id DESC LIMIT 20)`;
-          // Stream only a validated response. Raw model tokens never bypass citation/redaction checks.
-          for (let i = 0; i < answer.text.length; i += 80) {
-            send("delta", { delta: answer.text.slice(i, i + 80) });
-            await Promise.resolve();
-          }
+          // Without provisional streaming, the validated answer is sent in chunks. With it,
+          // the redacted sentences were already shown; a failed answer withdraws them.
+          if (answer.status !== "ok") retract();
+          if (!provisional || answer.status !== "ok")
+            for (let i = 0; i < answer.text.length; i += 80) {
+              send("delta", { delta: answer.text.slice(i, i + 80) });
+              await Promise.resolve();
+            }
           send("conversation", {
             messages: this.history(),
             status: answer.status,

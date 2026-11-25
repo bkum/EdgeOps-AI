@@ -4,6 +4,8 @@
 export type AssistantEvent = {
   progress?: string;
   delta?: string;
+  // Provisional text was withdrawn; discard what was shown.
+  retract?: boolean;
   error?: string;
   messages?: { role: string; content: string }[];
 };

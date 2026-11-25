@@ -31,7 +31,7 @@ All paths below use `/api/v1`. `X-EdgeOps-Scope` selects an authorized registere
 | GET, POST /integrations | Provider resource metadata only, never credentials |
 | POST /integrations/:provider/:serviceId/sync | Bounded approved read-only sync with explicit coverage/gaps |
 | GET /telemetry, /usage, /settings, /notifications, /audit | Persisted operational views |
-| PATCH /settings | AI circuit breaker, call cap, explicit token prices and retention |
+| PATCH /settings | AI circuit breaker, call cap, explicit token prices, retention and optional `operatorWaitHours` (1–168; omitted keeps the stored value) |
 | POST /notifications/:id/read | Mark persisted notification read |
 | GET /export; POST /retention/run | Scoped sanitized export and retention cleanup |
 | GET, POST, DELETE /assistant | Persistent per-actor conversations; POST accepts free-text question and optional conversationId, GET/DELETE accept conversationId query |
@@ -40,16 +40,12 @@ Implemented conventions (2026-11-25):
 
 - **Errors:** every error uses `{error: {code, message, retryable}, requestId}`. That includes 404 for unknown or foreign resources, validation (422), conflicts (409), rate limits (429, retryable) and dependency failures (503).
 - **Idempotent replay:** reusing an `Idempotency-Key` with the same payload returns the resource's **current** state, not a stored copy of the first response. A different payload returns 409.
-- **Pagination:** lists are bounded rather than paginated:
-  - 20 recent incidents in the overview
-  - 50 notifications
-  - 100 telemetry, knowledge and audit rows
-  - export: 500 incidents, 1000 knowledge and telemetry rows, 5000 events, with `truncated` flags
-
-  Cursor pagination remains proposed.
+- **Pagination:** `GET /incidents`, `/notifications`, `/knowledge`, `/telemetry` and `/audit` take `?limit` (1–100; defaults 20, 50, 100, 100, 100) and an opaque `?cursor`, and return `{data: [...], meta: {nextCursor}}` (`null` on the last page). Pages are newest first with ties broken by ID, so rows added during a walk never repeat or shift a page. A cursor from another list, a malformed cursor or an out-of-range limit is 422. The overview stays bounded at 20 incidents; the export stays bounded with `truncated` flags.
+- **Recommendations:** `GET /incidents/:id/recommendations` lists the current attempt's records (`action`, `rationale`, `evidence_ids`, `source`, `disposition`, `version`). `PATCH /incidents/:id/recommendations/:recId` takes `{disposition: proposed|accepted|rejected|done, expectedVersion, note?}`: 404 for unknown or foreign IDs, 409 for a stale version. It records a decision only. The incident detail includes `recommendations`.
+- **Notification destinations:** `GET /notifications/destinations` returns `[{destination, host, format, sent, pending, failed}]` for webhooks configured in the `NOTIFICATION_WEBHOOKS` secret. The URL is never returned.
 - **Environment access:** `GET /scopes` lists only environments the principal may use. With `SCOPE_GRANTS` set, other environments return 404, and only principals granted `*` may register environments. A private deployment rejects demo environments.
 
-Assistant SSE frames: `progress`, `delta` (validated text), `conversation` (canonical messages/status/citations) and safe `error`. A conversation is keyed by verified actor, scope and conversationId. Model-selected tools are read-only and have strict argument schemas; models cannot call mutating HTTP endpoints. Confirmed-knowledge changes invalidate derived conversation context.
+Assistant SSE frames: `progress`, `delta` (validated text; `provisional: true` when `AI_STREAMING=on` streams redacted sentences before final validation), `retract` (discard provisional text), `conversation` (canonical messages/status/citations, which always replaces provisional text) and safe `error`. A conversation is keyed by verified actor, scope and conversationId. Model-selected tools are read-only and have strict argument schemas; models cannot call mutating HTTP endpoints. Confirmed-knowledge changes invalidate derived conversation context.
 
 ## Proposed full MVP API
 
@@ -86,3 +82,5 @@ Probe contract: service ID, status (healthy/degraded/unhealthy/unknown), observe
 Before implementation, convert this draft into schema-backed contracts and test HTTP plus WebSocket/session authorization, invalid ranges, pagination, concurrency and idempotent replay. Chat and tool APIs share the same authorization boundary.
 
 `GET /api/v1/deployments/comparisons` returns scoped latest GitHub revision pairs, source/provenance, configured deployment environment, before/after probe windows and failure-rate/p95 deltas. Deltas are null with an explicit unavailable reason if freshness, environment mapping, revision history, bounds or minimum distinct probe runs fail. Correlation never confirms cause.
+
+`GET /incidents/:id` also returns `recovered` (three healthy post-verify runs) and `recovery`: the baseline comparison and disclosures, saved at resolution and computed live while verifying; `null` otherwise.

@@ -29,6 +29,10 @@ Implemented transitions (verified against `src/operations.ts`, 2026-11-25):
 - **Dismiss** is accepted from any open state. It records a reason and cancels unfinished diagnostic work.
 - **Cancel** stops the run and returns the incident to `awaiting_operator`, where it can be retried.
 - **Retry** is allowed for `partial`, `failed` or `cancelled` runs, up to five attempts.
+- **History (step 4)** is collected with the evidence: up to three earlier closed incidents of the same service, operator-confirmed lessons first, each labeled `operator-confirmed` or `unconfirmed`.
+- **Follow-up queries (step 5)**: the first summary may name up to two queries from a fixed catalog (`probe-history-24h`, `dependency-health`, `recent-deployments`, `worker-logs`). The server derives scope, service and window, persists the results as `follow-up:*` evidence, and requests one final summary that cannot ask for more. If the refined summary is unavailable, the first one stands.
+- **Operator wait (step 6)**: after `settings.operator_wait_hours` (default 24) without activity in `awaiting_operator`, scheduled maintenance records `operator-wait-expired` and a notification. The incident is not closed and its version is unchanged.
+- **Recovery report (step 8)**: median latency of the post-verify runs against healthy pre-incident samples, telemetry since verification and disclosed gaps. Saved at resolution; it never resolves or confirms anything by itself.
 - **Failed verification** re-queues a new attempt when the cap allows; otherwise it returns the incident to the operator. Only probe runs recorded after the latest verify request count.
 
 1. Detect threshold breach using valid windows/sample counts. Claim a scope/service/signal dedupe key, persist incident and dispatch intent.

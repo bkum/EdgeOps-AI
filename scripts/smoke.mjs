@@ -727,6 +727,139 @@ try {
     }),
   });
   assert.match(await later.text(), /Demo connection pool was exhausted/);
+  // ID swaps over HTTP: real demo IDs sent with the live environment selected must be
+  // indistinguishable from missing records and leave the demo records untouched.
+  {
+    const notFound = async (response, label) => {
+      assert.equal(response.status, 404, label);
+      const body = await response.json();
+      assert.equal(body.error.code, "not_found", label);
+    };
+    const swapped = (path, init = {}) =>
+      api(path, { ...init, headers: { ...liveHeaders, ...init.headers } });
+    const lesson = knowledge[0];
+    await notFound(
+      await swapped(`/knowledge/${lesson.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ expectedVersion: lesson.version, content: "Intruder edit" }),
+      }),
+      "knowledge PATCH",
+    );
+    await notFound(
+      await swapped(`/knowledge/${lesson.id}`, {
+        method: "DELETE",
+        body: JSON.stringify({ expectedVersion: lesson.version }),
+      }),
+      "knowledge DELETE",
+    );
+    const lessonAfter = (await (await api("/knowledge")).json()).data.find(
+      (k) => k.id === lesson.id,
+    );
+    assert.deepEqual(
+      [lessonAfter.content, lessonAfter.version],
+      [lesson.content, lesson.version],
+    );
+    const [note] = (await (await api("/notifications")).json()).data;
+    assert(note, "demo environment has a notification");
+    await notFound(
+      await swapped(`/notifications/${note.id}/read`, { method: "POST", body: "{}" }),
+      "notification read",
+    );
+    const noteAfter = (await (await api("/notifications")).json()).data.find(
+      (n) => n.id === note.id,
+    );
+    assert.equal(noteAfter.read_at, note.read_at);
+    const incidentBefore = (await (await api(`/incidents/${first.id}`)).json()).data;
+    await notFound(
+      await swapped(`/incidents/${first.id}/operator-actions`, {
+        method: "POST",
+        headers: { "Idempotency-Key": "swap-operator-action" },
+        body: JSON.stringify({
+          action: "dismiss",
+          expectedVersion: incidentBefore.incident.version,
+          note: "Intruder dismissal",
+        }),
+      }),
+      "operator action",
+    );
+    await notFound(await swapped(`/incidents/${first.id}/events`), "incident events");
+    assert.equal(
+      (await (await api(`/incidents/${first.id}`)).json()).data.incident.version,
+      incidentBefore.incident.version,
+    );
+    await notFound(
+      await swapped("/services/demo-api/probes", {
+        method: "POST",
+        headers: { "Idempotency-Key": "swap-probe-key" },
+        body: "{}",
+      }),
+      "service probe",
+    );
+    await notFound(
+      await swapped("/integrations/github/demo-api/sync", { method: "POST", body: "{}" }),
+      "integration sync",
+    );
+    // Recommendations are records: another environment cannot see or decide them, and
+    // a stale version conflicts.
+    const recommendations = (await (await api(`/incidents/${first.id}/recommendations`)).json()).data;
+    assert(recommendations.length > 0, "fixture investigation stored recommendations");
+    const [rec] = recommendations;
+    await notFound(await swapped(`/incidents/${first.id}/recommendations`), "recommendations list");
+    await notFound(
+      await swapped(`/incidents/${first.id}/recommendations/${rec.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ disposition: "rejected", expectedVersion: rec.version }),
+      }),
+      "recommendation PATCH",
+    );
+    const decided = await api(`/incidents/${first.id}/recommendations/${rec.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ disposition: "accepted", expectedVersion: rec.version, note: "Smoke check." }),
+    });
+    assert.equal((await decided.json()).data.disposition, "accepted");
+    const stale = await api(`/incidents/${first.id}/recommendations/${rec.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ disposition: "done", expectedVersion: rec.version }),
+    });
+    assert.equal(stale.status, 409);
+    assert.equal((await stale.json()).error.code, "conflict");
+    // Cursor pagination: pages do not overlap; a foreign or malformed cursor is a 422.
+    const pageOne = await (await api("/audit?limit=2")).json();
+    assert.equal(pageOne.data.length, 2);
+    assert(pageOne.meta.nextCursor, "audit has a second page");
+    const pageTwo = await (await api(`/audit?limit=2&cursor=${pageOne.meta.nextCursor}`)).json();
+    assert.equal(pageTwo.data.length, 2);
+    assert.notDeepEqual(pageTwo.data, pageOne.data);
+    for (const bad of [
+      `/notifications?cursor=${pageOne.meta.nextCursor}`,
+      "/audit?cursor=not-a-cursor",
+      "/audit?limit=500",
+    ]) {
+      const response = await api(bad);
+      assert.equal(response.status, 422, bad);
+      assert.equal((await response.json()).error.code, "validation", bad);
+    }
+    assert.deepEqual((await (await api("/notifications/destinations")).json()).data, []);
+    // Conversations are keyed by environment: the same ID elsewhere is a different, empty one.
+    const ownHistory = (
+      await (await api("/assistant?conversationId=later-conversation")).json()
+    ).messages;
+    assert(ownHistory.length > 0, "demo conversation has messages");
+    assert.deepEqual(
+      (await (await swapped("/assistant?conversationId=later-conversation")).json()).messages,
+      [],
+    );
+    const foreignDelete = await swapped("/assistant?conversationId=later-conversation", {
+      method: "DELETE",
+      body: "{}",
+    });
+    assert.equal(foreignDelete.status, 200);
+    await foreignDelete.text();
+    assert.deepEqual(
+      (await (await api("/assistant?conversationId=later-conversation")).json()).messages,
+      ownHistory,
+    );
+  }
   assert.equal(
     (
       await api(`/knowledge/${knowledge[0].id}`, {
@@ -796,6 +929,128 @@ try {
   console.log(
     "PASS: recovery, optimistic/idempotent operator actions, confirmed knowledge in a new conversation, corrections/deletion and context invalidation, recurrence, budget stop, scoped export and demo/live isolation.",
   );
+  if (browser) {
+    // XSS rendering: plant script payloads in every displayed text field of real API
+    // responses (inside JSON-encoded fields too) and visit every page with CSP bypassed,
+    // so only the UI's own escaping stands between the payload and execution.
+    const XSS =
+      `<img src=x onerror="window.__xss=(window.__xss||[]).concat('img')">` +
+      `<script>window.__xss=(window.__xss||[]).concat('script')</script>` +
+      `"><svg onload="window.__xss=(window.__xss||[]).concat('svg')"></svg>` +
+      `<a href="javascript:window.__xss=['href']">x</a>`;
+    const textKeys = new Set([
+      "name", "title", "content", "summary", "note", "confirmed_cause", "safe_error",
+      "application_name", "reason", "text", "message", "environment",
+      "recommendations", "unknowns", "gap", "answer",
+    ]);
+    const encodedKeys = new Set(["payload", "summary", "result", "config"]);
+    const poison = (value, key = "") => {
+      if (typeof value === "string") {
+        if (encodedKeys.has(key)) {
+          try {
+            const inner = JSON.parse(value);
+            if (inner && typeof inner === "object")
+              return JSON.stringify(poison(inner));
+          } catch {
+            /* plain text field */
+          }
+        }
+        return textKeys.has(key) ? `${value} ${XSS}` : value;
+      }
+      if (Array.isArray(value))
+        return value.map((item) =>
+          typeof item === "string" && textKeys.has(key) ? `${item} ${XSS}` : poison(item, key),
+        );
+      if (value && typeof value === "object")
+        return Object.fromEntries(
+          Object.entries(value).map(([k, v]) => [k, poison(v, k)]),
+        );
+      return value;
+    };
+    const context = await browser.newContext({
+      viewport: { width: 1440, height: 1100 },
+      bypassCSP: true,
+    });
+    const xssPage = await context.newPage();
+    xssPage.setDefaultTimeout(15_000);
+    const xssErrors = [];
+    let dialogs = 0;
+    xssPage.on("pageerror", (error) => xssErrors.push(error.message));
+    xssPage.on("dialog", (dialog) => {
+      dialogs++;
+      void dialog.dismiss();
+    });
+    await xssPage.route("**/api/v1/**", async (route) => {
+      const response = await route.fetch();
+      const type = response.headers()["content-type"] ?? "";
+      if (route.request().method() !== "GET" || !type.includes("application/json"))
+        return route.fulfill({ response });
+      const body = poison(await response.json());
+      // Make sure the assistant view always has a stored message to render.
+      if (route.request().url().includes("/api/v1/assistant") && Array.isArray(body.messages))
+        body.messages.push({ role: "assistant", content: `Answer ${XSS}` });
+      return route.fulfill({ response, json: body });
+    });
+    await xssPage.goto(base);
+    await xssPage.getByRole("button", { name: "Connect", exact: true }).click();
+    await xssPage.getByLabel("Local API token", { exact: true }).fill(token);
+    await xssPage.getByRole("button", { name: "Connect", exact: true }).click();
+    await xssPage.getByText(/onerror=/).first().waitFor();
+    const pages = [
+      "Overview", "AI Assistant", "Services", "Incidents", "Deployments", "Logs",
+      "Usage & cost", "Integrations", "Agent memory", "Settings",
+    ];
+    const rendered = [];
+    // Checked on every view: unmounted pages would otherwise hide injected elements.
+    const inspect = async (view) => {
+      const found = await xssPage.evaluate(() => ({
+        executed: window.__xss ?? null,
+        injected: document.querySelectorAll(
+          'img[src="x"], svg[onload], [onerror], [onload], script:not([src])',
+        ).length,
+        javascriptLinks: [...document.querySelectorAll("a[href]")].filter((a) =>
+          a.getAttribute("href").trim().toLowerCase().startsWith("javascript:"),
+        ).length,
+      }));
+      assert.deepEqual(
+        found,
+        { executed: null, injected: 0, javascriptLinks: 0 },
+        `XSS payload became markup on ${view}`,
+      );
+    };
+    const settle = () =>
+      xssPage.evaluate(
+        () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+      );
+    for (const name of pages) {
+      await xssPage.getByRole("button", { name, exact: true }).click();
+      await xssPage.waitForTimeout(400);
+      await settle();
+      if (await xssPage.getByText(/onerror=/).count()) rendered.push(name);
+      await inspect(name);
+    }
+    await xssPage.getByRole("button", { name: "Notifications", exact: true }).click();
+    await settle();
+    await inspect("Notifications");
+    await xssPage.keyboard.press("Escape");
+    await xssPage.getByRole("button", { name: "Services", exact: true }).click();
+    await xssPage.getByRole("button", { name: /^View .* details$/ }).first().click();
+    await xssPage.getByRole("dialog").getByText(/onerror=/).first().waitFor();
+    rendered.push("Investigation drawer");
+    await settle();
+    await inspect("Investigation drawer");
+    assert.equal(dialogs, 0);
+    assert.deepEqual(xssErrors, []);
+    // The payload must actually have reached the screen as text on most pages.
+    assert(
+      rendered.length >= 6,
+      `payload rendered as text on too few views: ${rendered.join(", ")}`,
+    );
+    await context.close();
+    console.log(
+      `PASS: XSS payloads in API data render as inert text with CSP bypassed (${rendered.join(", ")}).`,
+    );
+  }
   if (process.env.EDGEOPS_LIVE_PILOT === "1") {
     const count = Number(process.env.EDGEOPS_PILOT_SAMPLES ?? "3");
     assert(

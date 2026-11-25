@@ -24,6 +24,29 @@ export function detect(samples: Sample[]) {
     : "healthy";
 }
 
+// Server-defined follow-up queries the model may request by name only. It never supplies
+// scope, service, time range, URLs or SQL: the server derives all of them from the incident.
+export const FOLLOW_UPS = [
+  "probe-history-24h",
+  "dependency-health",
+  "recent-deployments",
+  "worker-logs",
+] as const;
+export type FollowUp = (typeof FOLLOW_UPS)[number];
+export const MAX_FOLLOW_UPS = 2;
+export const recommendationSchema = z.union([
+  z.string().min(1).max(500),
+  z
+    .object({
+      action: z.string().min(1).max(500),
+      rationale: z.string().min(1).max(500).optional(),
+      evidenceIds: z.array(z.string()).max(5).optional(),
+    })
+    .strict(),
+]);
+export type Recommendation = z.infer<typeof recommendationSchema>;
+export const recommendationAction = (r: Recommendation) =>
+  typeof r === "string" ? r : r.action;
 export const findingSchema = z
   .object({
     summary: z.string().min(1).max(1500),
@@ -49,14 +72,20 @@ export const findingSchema = z
           .strict(),
       )
       .max(3),
-    recommendations: z.array(z.string().min(1).max(500)).min(1).max(5),
+    // A plain manual step, or one with its rationale and supporting evidence.
+    recommendations: z.array(recommendationSchema).min(1).max(5),
     unknowns: z.array(z.string().min(1).max(500)).min(1).max(5),
+    followUps: z.array(z.enum(FOLLOW_UPS)).max(MAX_FOLLOW_UPS).optional(),
   })
   .strict();
 export type Finding = z.infer<typeof findingSchema>;
 export function validateFinding(input: unknown, allowedIds: string[]): Finding {
   const finding = findingSchema.parse(input);
-  for (const claim of [...finding.observations, ...finding.hypotheses]) {
+  for (const claim of [
+    ...finding.observations,
+    ...finding.hypotheses,
+    ...finding.recommendations.map((r) => (typeof r === "string" ? { evidenceIds: [] } : { evidenceIds: r.evidenceIds ?? [] })),
+  ]) {
     if (claim.evidenceIds.some((id) => !allowedIds.includes(id)))
       throw new Error("Invalid evidence citation");
   }
